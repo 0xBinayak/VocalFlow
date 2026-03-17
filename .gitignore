@@ -10,12 +10,9 @@ wheels/
 .venv
 
 # Generated audio, uploads & transcripts
-audio/*.wav
-!audio/.gitkeep
-uploads/*
-!uploads/.gitkeep
-transcripts/*.json
-!transcripts/.gitkeep
+audio/
+uploads/
+transcripts/
 *.mp3
 *.wav
 
