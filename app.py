@@ -386,7 +386,11 @@ function copyTranscript() {
 # ---------------------------------------------------------------------------
 # FastHTML app
 # ---------------------------------------------------------------------------
-app, rt = fast_app(hdrs=[Style(CSS), Script(JS)], static_path=str(BASE_DIR))
+from starlette.routing import Mount
+from starlette.staticfiles import StaticFiles
+
+app, rt = fast_app(hdrs=[Style(CSS), Script(JS)])
+app.mount("/audio", StaticFiles(directory=str(OUTPUT_DIR)), name="audio_static")
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +429,7 @@ def sidebar_item(entry: dict):
         exists = (TRANSCRIPT_DIR / json_name).exists()
         if exists:
             actions = Div(
-                A("View", href=f"/transcript/{json_name}", cls="si-btn dl"),
+                A(NotStr("&#8681;"), href=f"/transcript/{json_name.removesuffix('.json')}", cls="si-btn dl", title="Download"),
                 cls="si-actions",
             )
         else:
@@ -445,7 +449,7 @@ def sidebar_item(entry: dict):
     if exists:
         actions = Div(
             Button("Play", onclick=f"togglePlay('{uid}','/audio/{fname}')", cls="si-btn play"),
-            A("DL", href=f"/dl/{fname}", download=f"{_slug(entry.get('text', 'audio'))}.wav", cls="si-btn dl"),
+            A(NotStr("&#8681;"), href=f"/download/{fname.removesuffix('.wav')}", download=f"{_slug(entry.get('text', 'audio'))}.wav", cls="si-btn dl", title="Download"),
             cls="si-actions",
         )
         player = Div(id=f"player-{uid}", cls="si-player")
@@ -723,7 +727,7 @@ async def post(text: str, language: str, voice_mode: str,
         Div(
             P("Generated successfully", cls="status"),
             Audio(src=f"/audio/{out_name}", controls=True, autoplay=True),
-            A(f"Download {pretty_name}", href=f"/dl/{out_name}", download=pretty_name, cls="dl-link"),
+            A(f"Download {pretty_name}", href=f"/download/{out_name.removesuffix('.wav')}", download=pretty_name, cls="dl-link"),
             cls="result-ok fi",
         ),
         sidebar_history(),
@@ -793,7 +797,7 @@ async def post_transcribe(audio_file: UploadFile, whisper_model: str = "base",
                 ),
                 Div(
                     Button("Copy", id="copy-btn", onclick="copyTranscript()", cls="si-btn dl"),
-                    A("Download JSON", href=f"/transcript/{json_name}", download=pretty_json, cls="dl-link"),
+                    A("Download JSON", href=f"/transcript/{json_name.removesuffix('.json')}", download=pretty_json, cls="dl-link"),
                     cls="transcript-actions",
                 ),
                 cls="result-ok fi",
@@ -809,24 +813,34 @@ async def post_transcribe(audio_file: UploadFile, whisper_model: str = "base",
         return Div(P(f"Transcription failed: {e}"), cls="err")
 
 
-@rt("/dl/{fname}")
-def get_download(fname: str):
+@rt("/download/{fid}")
+def get_download(fid: str):
+    fname = fid + ".wav"
     fpath = OUTPUT_DIR / fname
     if not fpath.exists():
         return Response("File not found", status_code=404)
     entry = _find_entry(fname)
     dl_name = f"{_slug(entry['text'])}.wav" if entry else fname
-    return FileResponse(str(fpath), media_type="audio/wav", filename=dl_name)
+    return Response(
+        content=fpath.read_bytes(),
+        media_type="audio/wav",
+        headers={"Content-Disposition": f'attachment; filename="{dl_name}"'},
+    )
 
 
-@rt("/transcript/{fname}")
-def get_transcript(fname: str):
+@rt("/transcript/{fid}")
+def get_transcript(fid: str):
+    fname = fid + ".json"
     fpath = TRANSCRIPT_DIR / fname
     if not fpath.exists():
         return Response("File not found", status_code=404)
     entry = _find_entry(fname)
     dl_name = f"{_slug(entry['text'])}.json" if entry else fname
-    return FileResponse(str(fpath), media_type="application/json", filename=dl_name)
+    return Response(
+        content=fpath.read_bytes(),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{dl_name}"'},
+    )
 
 
 @rt("/sidebar")
