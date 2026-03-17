@@ -1,0 +1,23 @@
+[project]
+name = "tts-portal"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "python-fasthtml>=0.12.50",
+    "python-multipart>=0.0.22",
+    "qwen-tts>=0.1.1",
+    "soundfile>=0.13.1",
+    "torch>=2.10.0",
+    "torchaudio>=2.10.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchaudio = { index = "pytorch-cu126" }
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
