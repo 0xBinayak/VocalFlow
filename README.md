@@ -80,23 +80,8 @@ VocalFlow uses two open-source model families:
 
 ## Requirements
 
-- **Python** 3.11+
-- **CUDA GPU** with 6+ GB VRAM (for TTS; transcription can run on CPU)
-- **FFmpeg** — required by Whisper for audio processing
-- [uv](https://docs.astral.sh/uv/) package manager (recommended)
-
-### Installing FFmpeg
-
-```bash
-# Windows
-winget install ffmpeg
-
-# macOS
-brew install ffmpeg
-
-# Ubuntu/Debian
-sudo apt install ffmpeg
-```
+- Python 3.11+ and [FFmpeg](https://ffmpeg.org/) (`winget install ffmpeg` / `brew install ffmpeg` / `apt install ffmpeg`)
+- CUDA GPU with 6+ GB VRAM for TTS (transcription can run on CPU)
 
 ## Quick Start
 
