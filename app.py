@@ -1,5 +1,7 @@
 import uuid
 import json
+import os
+import time
 import torch
 import soundfile as sf
 from pathlib import Path
@@ -7,14 +9,16 @@ from datetime import datetime
 from fasthtml.common import *
 
 # ---------------------------------------------------------------------------
-# Paths (absolute — immune to cwd changes from uvicorn reloader)
+# Paths
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "audio"
+TRANSCRIPT_DIR = BASE_DIR / "transcripts"
 HISTORY_FILE = BASE_DIR / "history.json"
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
+TRANSCRIPT_DIR.mkdir(exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # History helpers
@@ -46,7 +50,7 @@ def _add_history(filename: str, text: str, mode: str, language: str, voice_desc:
 
 
 # ---------------------------------------------------------------------------
-# Model loading (lazy)
+# TTS Model loading (lazy)
 # ---------------------------------------------------------------------------
 _base_model = None
 _design_model = None
@@ -83,7 +87,26 @@ def get_design_model():
 
 
 # ---------------------------------------------------------------------------
-# CSS — RadioFed palette (zinc + indigo)
+# Whisper model loading (lazy)
+# ---------------------------------------------------------------------------
+_whisper_model = None
+_whisper_size = None
+
+
+def get_whisper_model(size: str = "base"):
+    global _whisper_model, _whisper_size
+    if _whisper_model is None or _whisper_size != size:
+        import whisper
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"[model] Loading Whisper '{size}' on {device.upper()} ...")
+        _whisper_model = whisper.load_model(size, device=device)
+        _whisper_size = size
+        print("[model] Whisper ready.")
+    return _whisper_model
+
+
+# ---------------------------------------------------------------------------
+# CSS
 # ---------------------------------------------------------------------------
 CSS = """
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
@@ -93,12 +116,87 @@ body{font-family:'Inter',system-ui,sans-serif;background:#09090b;color:#e4e4e7;m
 a{color:#818cf8;text-decoration:none}
 a:hover{color:#a5b4fc}
 
-.wrap{max-width:760px;margin:0 auto;padding:24px}
+/* Layout: sidebar + main */
+.layout{display:flex;min-height:100vh}
 
-/* Header */
-.hdr{padding:32px 0 24px;border-bottom:1px solid #27272a;margin-bottom:24px;text-align:center}
-.hdr h1{font-size:1.75rem;font-weight:700;color:#f4f4f5;letter-spacing:-.02em}
-.hdr p{color:#71717a;font-size:.9rem;margin-top:2px}
+/* Sidebar */
+.sidebar{
+    width:300px;min-width:300px;
+    background:#111113;border-right:1px solid #27272a;
+    display:flex;flex-direction:column;
+    overflow:hidden;
+}
+.sidebar-brand{
+    padding:20px;border-bottom:1px solid #27272a;
+    text-align:center;
+}
+.sidebar-brand h1{font-size:1.2rem;font-weight:700;color:#f4f4f5;letter-spacing:-.02em}
+.sidebar-brand p{color:#52525b;font-size:.72rem;margin-top:2px}
+.sidebar-hist{flex:1;overflow-y:auto;padding:12px}
+.sidebar-hist::-webkit-scrollbar{width:4px}
+.sidebar-hist::-webkit-scrollbar-thumb{background:#27272a;border-radius:4px}
+.sidebar-hdr{
+    display:flex;align-items:center;justify-content:space-between;
+    margin-bottom:10px;padding:0 4px;
+}
+.sidebar-hdr h3{font-size:.7rem;font-weight:600;color:#71717a;text-transform:uppercase;letter-spacing:.5px;margin:0}
+.sidebar-count{font-size:.68rem;color:#52525b}
+
+.si{
+    display:flex;align-items:flex-start;gap:10px;
+    padding:10px 12px;
+    background:#18181b;border:1px solid transparent;border-radius:8px;
+    margin-bottom:4px;transition:all .15s;cursor:default;
+}
+.si:hover{border-color:#27272a;background:#1c1c1f}
+.si-icon{
+    width:26px;height:26px;border-radius:6px;
+    display:flex;align-items:center;justify-content:center;
+    font-size:.65rem;font-weight:700;flex-shrink:0;margin-top:1px;
+}
+.si-icon.tts{background:#1e1b4b;color:#a78bfa}
+.si-icon.clone{background:#172554;color:#60a5fa}
+.si-icon.design{background:#1e1b4b;color:#a78bfa}
+.si-icon.transcribe{background:#052e16;color:#4ade80}
+.si-meta{flex:1;min-width:0}
+.si-text{font-size:.78rem;color:#d4d4d8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.si-sub{font-size:.65rem;color:#52525b;margin-top:1px}
+.si-actions{display:flex;gap:3px;flex-shrink:0;margin-top:2px}
+.si-btn{
+    padding:3px 8px;border-radius:5px;font-size:.65rem;font-weight:500;
+    text-decoration:none;border:1px solid #27272a;background:none;cursor:pointer;
+    transition:all .15s;color:#a1a1aa;
+}
+.si-btn:hover{background:#27272a;color:#f4f4f5}
+.si-btn.play{color:#4ade80}
+.si-btn.play:hover{background:#052e16;border-color:#166534}
+.si-btn.dl{color:#818cf8}
+.si-btn.dl:hover{background:#1e1b4b;border-color:#818cf8}
+.si-player{overflow:hidden;max-height:0;transition:max-height .25s ease}
+.si-player.open{max-height:60px;padding:4px 12px 6px}
+.si-player audio{width:100%;height:32px;border-radius:6px}
+.sidebar-empty{
+    text-align:center;color:#52525b;font-size:.78rem;
+    padding:30px 16px;
+}
+
+/* Main content */
+.main{flex:1;overflow-y:auto;padding:32px 40px;max-width:900px}
+.main-hdr{margin-bottom:24px}
+.main-hdr h2{font-size:1.4rem;font-weight:700;color:#f4f4f5;letter-spacing:-.01em}
+.main-hdr p{color:#71717a;font-size:.85rem;margin-top:2px}
+
+/* Page tabs */
+.page-tabs{display:flex;gap:2px;margin-bottom:24px;border-bottom:1px solid #27272a}
+.ptab{
+    padding:10px 20px;color:#71717a;font-size:.88rem;font-weight:500;
+    cursor:pointer;border:none;background:none;
+    border-bottom:2px solid transparent;transition:all .15s;
+}
+.ptab:hover{color:#e4e4e7}
+.ptab.on{color:#818cf8;border-bottom-color:#818cf8}
+.page-panel{display:none}
+.page-panel.active{display:block}
 
 /* Cards */
 .cd{background:#18181b;border:1px solid #27272a;border-radius:10px;padding:20px;margin-bottom:16px}
@@ -119,7 +217,7 @@ textarea,input[type=text],select{
 textarea:focus,input:focus,select:focus{outline:none;border-color:#818cf8;box-shadow:0 0 0 3px rgba(129,140,248,.12)}
 select{cursor:pointer}
 
-/* Tabs */
+/* Voice sub-tabs */
 .tabs{display:flex;gap:2px;margin-bottom:14px;border-bottom:1px solid #27272a;padding-bottom:0}
 .tb{
     padding:10px 18px;color:#a1a1aa;font-size:.875rem;font-weight:500;
@@ -128,8 +226,6 @@ select{cursor:pointer}
 }
 .tb:hover{color:#f4f4f5}
 .tb.on{color:#818cf8;border-bottom-color:#818cf8}
-
-/* Tab panels (voice source) */
 .tab-panel{display:none}
 .tab-panel.active{display:block}
 
@@ -143,7 +239,7 @@ input[type=file]::file-selector-button{
 }
 input[type=file]::file-selector-button:hover{background:#3f3f46}
 
-/* Generate button */
+/* Buttons */
 .btn-gen{
     display:block;width:100%;padding:12px;margin-top:8px;
     background:#818cf8;color:#09090b;
@@ -155,8 +251,19 @@ input[type=file]::file-selector-button:hover{background:#3f3f46}
 .btn-gen:active{transform:scale(.99)}
 .btn-gen:disabled{opacity:.35;cursor:not-allowed;transform:none}
 
+.btn-transcribe{
+    display:block;width:100%;padding:12px;margin-top:8px;
+    background:#4ade80;color:#09090b;
+    border:none;border-radius:8px;
+    font-size:.95rem;font-weight:700;cursor:pointer;
+    letter-spacing:.3px;transition:all .15s;
+}
+.btn-transcribe:hover{background:#86efac}
+.btn-transcribe:active{transform:scale(.99)}
+.btn-transcribe:disabled{opacity:.35;cursor:not-allowed;transform:none}
+
 /* Result */
-#result{margin-top:16px}
+#tts-result,#transcribe-result{margin-top:16px}
 .result-ok{
     background:#052e16;border:1px solid #166534;
     border-radius:10px;padding:16px 20px;
@@ -169,6 +276,25 @@ audio{width:100%;border-radius:6px;margin:6px 0}
     transition:color .15s;
 }
 .dl-link:hover{color:#a5b4fc}
+
+/* Transcript result */
+.transcript-box{
+    background:#18181b;border:1px solid #27272a;
+    border-radius:10px;padding:16px 20px;
+    max-height:400px;overflow-y:auto;
+}
+.transcript-box pre{
+    font-family:'Inter',system-ui,sans-serif;
+    font-size:.88rem;color:#e4e4e7;
+    white-space:pre-wrap;word-wrap:break-word;
+    line-height:1.7;
+}
+.transcript-meta{
+    font-size:.75rem;color:#71717a;margin-top:8px;
+    padding-top:8px;border-top:1px solid #27272a;
+}
+.transcript-actions{display:flex;gap:8px;margin-top:10px}
+.transcript-actions .dl-link{font-size:.78rem}
 
 /* Error */
 .err{
@@ -190,65 +316,16 @@ audio{width:100%;border-radius:6px;margin:6px 0}
 @keyframes spin{to{transform:rotate(360deg)}}
 .sp-text{color:#71717a;font-size:.88rem}
 
-/* History */
-.hist{margin-top:28px}
-.hist-hdr{
-    display:flex;align-items:center;justify-content:space-between;
-    margin-bottom:14px;
-}
-.hist-hdr h3{font-size:.8rem;font-weight:600;color:#a1a1aa;text-transform:uppercase;letter-spacing:.4px;margin:0}
-.hist-count{font-size:.75rem;color:#71717a}
-
-.hi{
-    display:flex;align-items:center;gap:12px;
-    padding:12px 14px;
-    background:#18181b;border:1px solid #27272a;border-radius:8px;
-    margin-bottom:6px;transition:border-color .15s;
-}
-.hi:hover{border-color:#3f3f46}
-
-.hi-icon{
-    width:30px;height:30px;border-radius:6px;
-    display:flex;align-items:center;justify-content:center;
-    font-size:.75rem;font-weight:700;flex-shrink:0;
-}
-.hi-icon.clone{background:#172554;color:#60a5fa}
-.hi-icon.design{background:#1e1b4b;color:#a78bfa}
-
-.hi-meta{flex:1;min-width:0}
-.hi-text{font-size:.82rem;color:#e4e4e7;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.hi-sub{font-size:.72rem;color:#71717a;margin-top:1px}
-
-.hi-actions{display:flex;gap:4px;flex-shrink:0}
-.hi-btn{
-    padding:4px 10px;border-radius:6px;font-size:.72rem;font-weight:500;
-    text-decoration:none;border:1px solid #27272a;background:none;cursor:pointer;
-    transition:all .15s;
-}
-.hi-btn.play{color:#4ade80}
-.hi-btn.play:hover{background:#052e16;border-color:#166534}
-.hi-btn.dl{color:#818cf8}
-.hi-btn.dl:hover{background:#1e1b4b;border-color:#818cf8}
-.hi-btn.miss{color:#f87171;opacity:.5;cursor:default;border-style:dashed}
-.hi-player{overflow:hidden;max-height:0;transition:max-height .25s ease}
-.hi-player.open{max-height:60px;padding:6px 14px 8px}
-.hi-player audio{width:100%;height:36px;border-radius:6px}
-
-.hist-empty{
-    text-align:center;color:#71717a;font-size:.85rem;
-    padding:24px;background:#18181b;border-radius:10px;
-    border:1px dashed #27272a;
-}
-
-/* Badges */
-.bg{display:inline-block;padding:2px 10px;border-radius:99px;font-size:.72rem;font-weight:500}
-.bg-g{background:#052e16;color:#4ade80}
-.bg-b{background:#172554;color:#60a5fa}
-.bg-y{background:#422006;color:#fbbf24}
-
 /* Animation */
 .fi{animation:fi .3s ease}
 @keyframes fi{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+
+/* Responsive */
+@media(max-width:768px){
+    .layout{flex-direction:column}
+    .sidebar{width:100%;min-width:100%;max-height:200px;border-right:none;border-bottom:1px solid #27272a}
+    .main{padding:20px}
+}
 """
 
 JS = """
@@ -259,18 +336,33 @@ function togglePlay(uid, src) {
         el.innerHTML = '';
         return;
     }
-    document.querySelectorAll('.hi-player.open').forEach(function(p) {
+    document.querySelectorAll('.si-player.open').forEach(function(p) {
         p.classList.remove('open'); p.innerHTML = '';
     });
     el.innerHTML = '<audio src="' + src + '" controls autoplay></audio>';
     el.classList.add('open');
 }
-function switchTab(mode) {
+function switchVoiceTab(mode) {
     document.querySelectorAll('.vtb').forEach(b => b.classList.remove('on'));
-    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-    document.querySelector('[data-tab="'+mode+'"]').classList.add('on');
-    document.getElementById('panel-'+mode).classList.add('active');
+    document.querySelectorAll('.voice-panel').forEach(p => p.classList.remove('active'));
+    document.querySelector('[data-vtab="'+mode+'"]').classList.add('on');
+    document.getElementById('vpanel-'+mode).classList.add('active');
     document.getElementById('voice_mode').value = mode;
+}
+function switchPage(page) {
+    document.querySelectorAll('.ptab').forEach(b => b.classList.remove('on'));
+    document.querySelectorAll('.page-panel').forEach(p => p.classList.remove('active'));
+    document.querySelector('[data-page="'+page+'"]').classList.add('on');
+    document.getElementById('page-'+page).classList.add('active');
+}
+function copyTranscript() {
+    var el = document.getElementById('transcript-text');
+    if (el) {
+        navigator.clipboard.writeText(el.innerText);
+        var btn = document.getElementById('copy-btn');
+        btn.innerText = 'Copied!';
+        setTimeout(function(){ btn.innerText = 'Copy'; }, 1500);
+    }
 }
 """
 
@@ -281,78 +373,111 @@ app, rt = fast_app(hdrs=[Style(CSS), Script(JS)], static_path=str(BASE_DIR))
 
 
 # ---------------------------------------------------------------------------
-# Components
+# Sidebar components
 # ---------------------------------------------------------------------------
-def history_item(entry: dict):
+def sidebar_item(entry: dict):
     fname = entry["file"]
-    exists = (OUTPUT_DIR / fname).exists()
-    is_clone = entry.get("mode") == "clone"
-    icon_cls = "hi-icon clone" if is_clone else "hi-icon design"
-    icon_txt = "C" if is_clone else "D"
-    mode_label = "Clone" if is_clone else "Design"
+    mode = entry.get("mode", "")
+    is_transcribe = mode == "transcribe"
+
+    if is_transcribe:
+        icon_cls = "si-icon transcribe"
+        icon_txt = "T"
+        mode_label = "Transcribe"
+    elif mode == "clone":
+        icon_cls = "si-icon clone"
+        icon_txt = "C"
+        mode_label = "Clone"
+    else:
+        icon_cls = "si-icon design"
+        icon_txt = "D"
+        mode_label = "Design"
+
     voice = entry.get("voice", "")
-    sub = f'{entry.get("time", "")}  ·  {mode_label}  ·  {entry.get("language", "")}'
+    sub = f'{entry.get("time", "")}  ·  {mode_label}'
+    lang = entry.get("language", "")
+    if lang:
+        sub += f"  ·  {lang}"
     if voice:
-        sub += f"  ·  {voice[:35]}"
+        sub += f"  ·  {voice[:30]}"
 
     uid = fname.replace(".", "_")
+
+    if is_transcribe:
+        json_name = fname
+        exists = (TRANSCRIPT_DIR / json_name).exists()
+        if exists:
+            actions = Div(
+                A("View", href=f"/transcript/{json_name}", cls="si-btn dl"),
+                cls="si-actions",
+            )
+        else:
+            actions = Div()
+        return Div(
+            Div(icon_txt, cls=icon_cls),
+            Div(
+                Div(entry.get("text", "—"), cls="si-text"),
+                Div(sub, cls="si-sub"),
+                cls="si-meta",
+            ),
+            actions,
+            cls="si",
+        )
+
+    exists = (OUTPUT_DIR / fname).exists()
     if exists:
         actions = Div(
-            Button("Play", onclick=f"togglePlay('{uid}','/audio/{fname}')", cls="hi-btn play"),
-            A("Download", href=f"/dl/{fname}", download=fname, cls="hi-btn dl"),
-            cls="hi-actions",
+            Button("Play", onclick=f"togglePlay('{uid}','/audio/{fname}')", cls="si-btn play"),
+            A("DL", href=f"/dl/{fname}", download=fname, cls="si-btn dl"),
+            cls="si-actions",
         )
-        player = Div(id=f"player-{uid}", cls="hi-player")
+        player = Div(id=f"player-{uid}", cls="si-player")
     else:
-        actions = Div(Span("Missing", cls="hi-btn miss"), cls="hi-actions")
+        actions = Div()
         player = None
 
-    children = [
+    row = Div(
         Div(icon_txt, cls=icon_cls),
         Div(
-            Div(entry.get("text", "—"), cls="hi-text"),
-            Div(sub, cls="hi-sub"),
-            cls="hi-meta",
+            Div(entry.get("text", "—"), cls="si-text"),
+            Div(sub, cls="si-sub"),
+            cls="si-meta",
         ),
         actions,
-    ]
-    row = Div(*children, cls="hi", id=f"hi-{uid}")
+        cls="si", id=f"si-{uid}",
+    )
     if player:
         return Div(row, player)
     return row
 
 
-def history_section():
+def sidebar_history():
     entries = _load_history()
     if not entries:
         return Div(
             Div(
-                Div(H3("History"), cls="hist-hdr"),
-                Div("No generations yet. Create your first one above.", cls="hist-empty"),
+                Div(H3("History"), cls="sidebar-hdr"),
+                Div("No activity yet.", cls="sidebar-empty"),
             ),
-            cls="hist", id="history",
+            id="sidebar-history",
         )
-    items = [history_item(e) for e in entries[:20]]
+    items = [sidebar_item(e) for e in entries[:30]]
     return Div(
         Div(
-            Div(
-                H3("History"),
-                Span(f"{len(entries)} generation{'s' if len(entries) != 1 else ''}", cls="hist-count"),
-                cls="hist-hdr",
-            ),
-            *items,
+            H3("History"),
+            Span(f"{len(entries)}", cls="sidebar-count"),
+            cls="sidebar-hdr",
         ),
-        cls="hist", id="history",
+        *items,
+        id="sidebar-history",
     )
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Page: TTS
 # ---------------------------------------------------------------------------
-@rt("/")
-def get():
+def tts_page():
     form = Form(
-        # Text input
         Div(
             H3("Input"),
             Div(
@@ -384,13 +509,12 @@ def get():
             ),
             cls="cd",
         ),
-        # Voice source
         Div(
             H3("Voice Source"),
             Input(type="hidden", name="voice_mode", id="voice_mode", value="prompt"),
             Div(
-                A("Voice Design", cls="vtb on", data_tab="prompt", onclick="switchTab('prompt')"),
-                A("Clone from Audio", cls="vtb", data_tab="audio", onclick="switchTab('audio')"),
+                A("Voice Design", cls="vtb on", data_vtab="prompt", onclick="switchVoiceTab('prompt')"),
+                A("Clone from Audio", cls="vtb", data_vtab="audio", onclick="switchVoiceTab('audio')"),
                 cls="tabs",
             ),
             Div(
@@ -402,7 +526,7 @@ def get():
                     ),
                     cls="field",
                 ),
-                id="panel-prompt", cls="tab-panel active",
+                id="vpanel-prompt", cls="voice-panel active tab-panel",
             ),
             Div(
                 Div(
@@ -418,32 +542,110 @@ def get():
                     ),
                     cls="field",
                 ),
-                id="panel-audio", cls="tab-panel",
+                id="vpanel-audio", cls="voice-panel tab-panel",
             ),
             cls="cd",
         ),
         Button("Generate Speech", cls="btn-gen", type="submit"),
         hx_post="/generate",
-        hx_target="#result",
-        hx_indicator="#spinner",
+        hx_target="#tts-result",
+        hx_indicator="#tts-spinner",
         hx_encoding="multipart/form-data",
         hx_disabled_elt=".btn-gen",
     )
 
     spinner = Div(
         Div(Span(cls="sp"), Span("Generating speech...", cls="sp-text"), cls="sp-wrap"),
-        id="spinner", cls="htmx-indicator",
+        id="tts-spinner", cls="htmx-indicator",
     )
-    result = Div(id="result")
+    result = Div(id="tts-result")
+    return Div(form, spinner, result)
 
-    return Title("TTS Portal"), Div(
-        Div(H1("TTS Portal"), P("Text-to-Speech · Voice Design & Cloning"), cls="hdr"),
-        form,
-        spinner,
-        result,
-        history_section(),
-        cls="wrap",
+
+# ---------------------------------------------------------------------------
+# Page: Transcribe
+# ---------------------------------------------------------------------------
+def transcribe_page():
+    form = Form(
+        Div(
+            H3("Transcribe Audio"),
+            Div(
+                Label("Audio File"),
+                Input(type="file", name="audio_file", accept=".wav,.mp3,.flac,.ogg,audio/*", required=True),
+                cls="field",
+            ),
+            Div(
+                Label("Whisper Model"),
+                Select(
+                    Option("tiny (fastest)", value="tiny"),
+                    Option("base (default)", value="base", selected=True),
+                    Option("small", value="small"),
+                    Option("medium", value="medium"),
+                    Option("large (best)", value="large"),
+                    Option("turbo", value="turbo"),
+                    name="whisper_model",
+                ),
+                cls="field",
+            ),
+            Div(
+                Label("Language (optional)"),
+                Select(
+                    Option("Auto-detect", value=""),
+                    Option("English", value="en"),
+                    Option("Chinese", value="zh"),
+                    Option("Japanese", value="ja"),
+                    Option("Korean", value="ko"),
+                    Option("German", value="de"),
+                    Option("French", value="fr"),
+                    Option("Russian", value="ru"),
+                    Option("Portuguese", value="pt"),
+                    Option("Spanish", value="es"),
+                    Option("Italian", value="it"),
+                    name="whisper_lang",
+                ),
+                cls="field",
+            ),
+            cls="cd",
+        ),
+        Button("Transcribe", cls="btn-transcribe", type="submit"),
+        hx_post="/transcribe",
+        hx_target="#transcribe-result",
+        hx_indicator="#transcribe-spinner",
+        hx_encoding="multipart/form-data",
+        hx_disabled_elt=".btn-transcribe",
     )
+
+    spinner = Div(
+        Div(Span(cls="sp"), Span("Transcribing audio...", cls="sp-text"), cls="sp-wrap"),
+        id="transcribe-spinner", cls="htmx-indicator",
+    )
+    result = Div(id="transcribe-result")
+    return Div(form, spinner, result)
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+@rt("/")
+def get():
+    sidebar = Div(
+        Div(H1("VocalFlow"), P("TTS & Transcription"), cls="sidebar-brand"),
+        Div(sidebar_history(), cls="sidebar-hist"),
+        cls="sidebar",
+    )
+
+    main = Div(
+        Div(
+            A("Speech", cls="ptab on", data_page="tts", onclick="switchPage('tts')"),
+            A("Transcribe", cls="ptab", data_page="transcribe", onclick="switchPage('transcribe')"),
+            cls="page-tabs",
+        ),
+        Div(tts_page(), id="page-tts", cls="page-panel active"),
+        Div(transcribe_page(), id="page-transcribe", cls="page-panel"),
+        cls="main",
+    )
+
+    return Title("VocalFlow"), Div(sidebar, main, cls="layout")
 
 
 @rt("/generate")
@@ -506,13 +708,88 @@ async def post(text: str, language: str, voice_mode: str,
             A(f"Download {out_name}", href=f"/dl/{out_name}", download=out_name, cls="dl-link"),
             cls="result-ok fi",
         ),
+        sidebar_history(),
+        Script("document.getElementById('sidebar-history').replaceWith(document.querySelectorAll('#sidebar-history')[1])"),
     )
 
 
-# ---------------------------------------------------------------------------
-# Download route (audio playback is handled by FastHTML's built-in static
-# handler which serves /audio/xxx.wav from BASE_DIR/audio/)
-# ---------------------------------------------------------------------------
+@rt("/transcribe")
+async def post_transcribe(audio_file: UploadFile, whisper_model: str = "base",
+                          whisper_lang: str = ""):
+    if not audio_file or not audio_file.filename:
+        return Div(P("Please upload an audio file."), cls="err")
+
+    ext = Path(audio_file.filename).suffix.lower()
+    tmp_name = f"{uuid.uuid4().hex}{ext}"
+    tmp_path = UPLOAD_DIR / tmp_name
+    content = await audio_file.read()
+    tmp_path.write_bytes(content)
+
+    try:
+        model = get_whisper_model(whisper_model)
+        t0 = time.perf_counter()
+
+        opts = {"word_timestamps": True, "verbose": False}
+        if whisper_lang:
+            opts["language"] = whisper_lang
+
+        result = model.transcribe(str(tmp_path), **opts)
+        elapsed = time.perf_counter() - t0
+
+        full_text = result.get("text", "").strip()
+        detected_lang = result.get("language", "unknown")
+
+        words_data = []
+        for seg in result.get("segments", []):
+            for w in seg.get("words", []):
+                words_data.append({
+                    "word": w["word"].strip(),
+                    "start": round(w["start"], 3),
+                    "end": round(w["end"], 3),
+                })
+
+        json_name = f"{uuid.uuid4().hex}.json"
+        json_path = TRANSCRIPT_DIR / json_name
+        json_path.write_text(json.dumps({
+            "text": full_text,
+            "language": detected_lang,
+            "words": words_data,
+            "model": whisper_model,
+            "elapsed": round(elapsed, 1),
+            "source": audio_file.filename,
+        }, indent=2, ensure_ascii=False), encoding="utf-8")
+
+        _add_history(json_name, full_text, "transcribe", detected_lang,
+                     f"{whisper_model} · {elapsed:.1f}s")
+
+        tmp_path.unlink(missing_ok=True)
+
+        return Div(
+            Div(
+                P("Transcription complete", cls="status"),
+                Div(Pre(full_text, id="transcript-text"), cls="transcript-box"),
+                Div(
+                    f"{len(words_data)} words · {detected_lang} · {whisper_model} · {elapsed:.1f}s",
+                    cls="transcript-meta",
+                ),
+                Div(
+                    Button("Copy", id="copy-btn", onclick="copyTranscript()", cls="si-btn dl"),
+                    A("Download JSON", href=f"/transcript/{json_name}", download=json_name, cls="dl-link"),
+                    cls="transcript-actions",
+                ),
+                cls="result-ok fi",
+            ),
+            sidebar_history(),
+            Script("document.getElementById('sidebar-history').replaceWith(document.querySelectorAll('#sidebar-history')[1])"),
+        )
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        tmp_path.unlink(missing_ok=True)
+        return Div(P(f"Transcription failed: {e}"), cls="err")
+
+
 @rt("/dl/{fname}")
 def get_download(fname: str):
     fpath = OUTPUT_DIR / fname
@@ -528,9 +805,24 @@ def get_download(fname: str):
     )
 
 
-@rt("/history")
-def get_history():
-    return history_section()
+@rt("/transcript/{fname}")
+def get_transcript(fname: str):
+    fpath = TRANSCRIPT_DIR / fname
+    if not fpath.exists():
+        return Response("File not found", status_code=404)
+    return Response(
+        content=fpath.read_bytes(),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{fname}"',
+            "Content-Length": str(fpath.stat().st_size),
+        },
+    )
+
+
+@rt("/sidebar")
+def get_sidebar():
+    return sidebar_history()
 
 
 serve()

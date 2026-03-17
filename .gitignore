@@ -9,11 +9,13 @@ wheels/
 # Virtual environments
 .venv
 
-# Generated audio & uploads
+# Generated audio, uploads & transcripts
 audio/*.wav
 !audio/.gitkeep
 uploads/*
 !uploads/.gitkeep
+transcripts/*.json
+!transcripts/.gitkeep
 *.mp3
 *.wav
 

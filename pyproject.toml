@@ -1,10 +1,11 @@
 [project]
-name = "tts-portal"
+name = "vocalflow"
 version = "0.1.0"
-description = "Add your description here"
+description = "Local TTS and audio transcription web app"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "openai-whisper>=20231117",
     "python-fasthtml>=0.12.50",
     "python-multipart>=0.0.22",
     "qwen-tts>=0.1.1",
