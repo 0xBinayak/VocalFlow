@@ -845,4 +845,5 @@ def get_sidebar():
     return sidebar_history()
 
 
-serve()
+if __name__ == "__main__":
+    serve()
