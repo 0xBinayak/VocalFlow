@@ -6,7 +6,7 @@ import torch
 import soundfile as sf
 from pathlib import Path
 from datetime import datetime
-from starlette.responses import FileResponse
+from starlette.staticfiles import StaticFiles
 from fasthtml.common import *
 
 # ---------------------------------------------------------------------------
@@ -386,9 +386,6 @@ function copyTranscript() {
 # ---------------------------------------------------------------------------
 # FastHTML app
 # ---------------------------------------------------------------------------
-from starlette.routing import Mount
-from starlette.staticfiles import StaticFiles
-
 app, rt = fast_app(hdrs=[Style(CSS), Script(JS)])
 app.mount("/audio", StaticFiles(directory=str(OUTPUT_DIR)), name="audio_static")
 
