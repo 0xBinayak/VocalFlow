@@ -1,3 +1,4 @@
+import re
 import uuid
 import json
 import time
@@ -5,6 +6,7 @@ import torch
 import soundfile as sf
 from pathlib import Path
 from datetime import datetime
+from starlette.responses import FileResponse
 from fasthtml.common import *
 
 # ---------------------------------------------------------------------------
@@ -46,6 +48,22 @@ def _add_history(filename: str, text: str, mode: str, language: str, voice_desc:
         "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
     })
     _save_history(entries[:50])
+
+
+def _slug(text: str, max_len: int = 50) -> str:
+    """Turn text into a safe filename slug."""
+    s = text.strip()[:max_len].lower()
+    s = re.sub(r'[^\w\s-]', '', s)
+    s = re.sub(r'[\s_]+', '-', s).strip('-')
+    return s or "untitled"
+
+
+def _find_entry(fname: str) -> dict | None:
+    """Look up a history entry by internal filename."""
+    for e in _load_history():
+        if e.get("file") == fname:
+            return e
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -427,7 +445,7 @@ def sidebar_item(entry: dict):
     if exists:
         actions = Div(
             Button("Play", onclick=f"togglePlay('{uid}','/audio/{fname}')", cls="si-btn play"),
-            A("DL", href=f"/dl/{fname}", download=fname, cls="si-btn dl"),
+            A("DL", href=f"/dl/{fname}", download=f"{_slug(entry.get('text', 'audio'))}.wav", cls="si-btn dl"),
             cls="si-actions",
         )
         player = Div(id=f"player-{uid}", cls="si-player")
@@ -699,12 +717,13 @@ async def post(text: str, language: str, voice_mode: str,
         return Div(P("Output file was not created. Please try again."), cls="err")
 
     _add_history(out_name, text.strip(), mode_label, language, voice_desc)
+    pretty_name = f"{_slug(text.strip())}.wav"
 
     return Div(
         Div(
             P("Generated successfully", cls="status"),
             Audio(src=f"/audio/{out_name}", controls=True, autoplay=True),
-            A(f"Download {out_name}", href=f"/dl/{out_name}", download=out_name, cls="dl-link"),
+            A(f"Download {pretty_name}", href=f"/dl/{out_name}", download=pretty_name, cls="dl-link"),
             cls="result-ok fi",
         ),
         sidebar_history(),
@@ -762,6 +781,7 @@ async def post_transcribe(audio_file: UploadFile, whisper_model: str = "base",
                      f"{whisper_model} · {elapsed:.1f}s")
 
         tmp_path.unlink(missing_ok=True)
+        pretty_json = f"{_slug(full_text)}.json"
 
         return Div(
             Div(
@@ -773,7 +793,7 @@ async def post_transcribe(audio_file: UploadFile, whisper_model: str = "base",
                 ),
                 Div(
                     Button("Copy", id="copy-btn", onclick="copyTranscript()", cls="si-btn dl"),
-                    A("Download JSON", href=f"/transcript/{json_name}", download=json_name, cls="dl-link"),
+                    A("Download JSON", href=f"/transcript/{json_name}", download=pretty_json, cls="dl-link"),
                     cls="transcript-actions",
                 ),
                 cls="result-ok fi",
@@ -794,14 +814,9 @@ def get_download(fname: str):
     fpath = OUTPUT_DIR / fname
     if not fpath.exists():
         return Response("File not found", status_code=404)
-    return Response(
-        content=fpath.read_bytes(),
-        media_type="audio/wav",
-        headers={
-            "Content-Disposition": f'attachment; filename="{fname}"',
-            "Content-Length": str(fpath.stat().st_size),
-        },
-    )
+    entry = _find_entry(fname)
+    dl_name = f"{_slug(entry['text'])}.wav" if entry else fname
+    return FileResponse(str(fpath), media_type="audio/wav", filename=dl_name)
 
 
 @rt("/transcript/{fname}")
@@ -809,14 +824,9 @@ def get_transcript(fname: str):
     fpath = TRANSCRIPT_DIR / fname
     if not fpath.exists():
         return Response("File not found", status_code=404)
-    return Response(
-        content=fpath.read_bytes(),
-        media_type="application/json",
-        headers={
-            "Content-Disposition": f'attachment; filename="{fname}"',
-            "Content-Length": str(fpath.stat().st_size),
-        },
-    )
+    entry = _find_entry(fname)
+    dl_name = f"{_slug(entry['text'])}.json" if entry else fname
+    return FileResponse(str(fpath), media_type="application/json", filename=dl_name)
 
 
 @rt("/sidebar")
