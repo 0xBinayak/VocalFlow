@@ -100,7 +100,27 @@ sudo apt install ffmpeg
 
 ## Quick Start
 
-### Option 1: From source (recommended)
+### Install
+
+```bash
+pip install vocalflow
+```
+
+### Launch the web app
+
+```bash
+vocalflow
+```
+
+Then open **http://localhost:5001** in your browser.
+
+### Transcription only (CLI)
+
+```bash
+vocalflow-transcribe audio.mp3 --model medium --language en
+```
+
+### From source
 
 ```bash
 git clone https://github.com/0xBinayak/VocalFlow.git
@@ -108,26 +128,6 @@ cd VocalFlow
 uv sync
 uv run app.py
 ```
-
-### Option 2: From PyPI
-
-```bash
-pip install vocalflow
-
-# Launch the web app
-vocalflow
-```
-
-### Option 3: Transcription only (CLI)
-
-```bash
-pip install vocalflow
-
-# Transcribe an audio file
-vocalflow-transcribe audio.mp3 --model medium --language en
-```
-
-Then open **http://localhost:5001** in your browser.
 
 > **First run:** The TTS and Whisper models will be downloaded automatically. This may take a few minutes depending on your connection.
 
@@ -231,27 +231,6 @@ Found a bug or have a feature request? [Open an issue](https://github.com/0xBina
 - What you expected vs. what happened
 - Steps to reproduce
 - Your OS, Python version, and GPU info
-
-## Releasing
-
-Maintainers can create a new release by bumping the version in `pyproject.toml` and tagging:
-
-```bash
-# 1. Update version in pyproject.toml
-# 2. Update lock file
-uv lock
-
-# 3. Commit, tag, and push
-git add pyproject.toml uv.lock
-git commit -m "Bump version to X.Y.Z"
-git tag vX.Y.Z
-git push origin main --tags
-```
-
-This automatically:
-- Runs CI checks
-- Creates a GitHub Release with build artifacts
-- Publishes to PyPI
 
 ## License
 
