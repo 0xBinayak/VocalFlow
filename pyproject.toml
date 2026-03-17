@@ -1,6 +1,6 @@
 [project]
 name = "vocalflow"
-version = "0.2.1"
+version = "0.3.0"
 description = "Local TTS and audio transcription web app"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -29,7 +29,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
-only-include = ["app.py", "transcribe.py"]
+only-include = ["app.py", "transcribe.py", "main.py"]
+
+[project.scripts]
+vocalflow = "main:main"
+vocalflow-transcribe = "main:transcribe_cli"
 
 [tool.ruff.lint]
 ignore = ["F403", "F405"]

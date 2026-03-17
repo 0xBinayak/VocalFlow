@@ -21,10 +21,10 @@ jobs:
           python-version: "3.11"
 
       - name: Check syntax
-        run: python -m py_compile app.py && python -m py_compile transcribe.py
+        run: python -m py_compile app.py && python -m py_compile transcribe.py && python -m py_compile main.py
 
       - name: Install ruff
         run: uv tool install ruff
 
       - name: Lint
-        run: ruff check app.py transcribe.py
+        run: ruff check app.py transcribe.py main.py

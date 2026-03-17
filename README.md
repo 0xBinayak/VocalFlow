@@ -113,6 +113,18 @@ uv run app.py
 
 ```bash
 pip install vocalflow
+
+# Launch the web app
+vocalflow
+```
+
+### Option 3: Transcription only (CLI)
+
+```bash
+pip install vocalflow
+
+# Transcribe an audio file
+vocalflow-transcribe audio.mp3 --model medium --language en
 ```
 
 Then open **http://localhost:5001** in your browser.
