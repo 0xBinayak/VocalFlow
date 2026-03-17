@@ -114,12 +114,6 @@ vocalflow
 
 Then open **http://localhost:5001** in your browser.
 
-### Transcription only (CLI)
-
-```bash
-vocalflow-transcribe audio.mp3 --model medium --language en
-```
-
 ### From source
 
 ```bash
@@ -148,89 +142,18 @@ VocalFlow/
     └── publish.yml     # Auto PyPI publish on version tags
 ```
 
-## CLI Transcription
-
-The transcriber can also be used standalone from the command line:
-
-```bash
-# Basic usage
-uv run python transcribe.py audio.mp3
-
-# With options
-uv run python transcribe.py audio.mp3 --model medium --language en --device cuda
-```
-
-Output is a JSON file with word-level timestamps:
-
-```json
-[
-  { "word": "Hello", "start": 0.0, "end": 0.32 },
-  { "word": "world", "start": 0.34, "end": 0.68 }
-]
-```
-
-## GPU Verification
-
-To verify your GPU is detected:
-
-```bash
-uv run python -c "import torch; print(f'CUDA: {torch.cuda.is_available()}, GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
-```
-
 ## Contributing
 
-Contributions are welcome! Here's how to get started:
+Contributions are welcome!
 
-### Setting up for development
+1. Fork the repo and clone it
+2. `uv sync` to install dependencies
+3. Create a branch, make changes, ensure `uvx ruff check app.py transcribe.py main.py` passes
+4. Open a Pull Request against `main`
 
-```bash
-git clone https://github.com/0xBinayak/VocalFlow.git
-cd VocalFlow
-uv sync
-```
+**Areas where help is appreciated:** additional TTS backends (Bark, StyleTTS2, F5-TTS), speaker diarization, batch processing, audio post-processing, UI improvements, and testing.
 
-### Code style
-
-We use [ruff](https://docs.astral.sh/ruff/) for linting:
-
-```bash
-uvx ruff check app.py transcribe.py
-```
-
-CI runs this automatically on every push and PR.
-
-### Making changes
-
-1. **Fork** the repository
-2. **Create a branch** for your feature or fix:
-   ```bash
-   git checkout -b feature/my-feature
-   ```
-3. **Make your changes** and ensure lint passes:
-   ```bash
-   uvx ruff check app.py transcribe.py
-   ```
-4. **Commit** with a clear message describing what and why
-5. **Open a Pull Request** against `main`
-
-### Areas where help is appreciated
-
-- Additional TTS model backends (e.g., Bark, StyleTTS2, F5-TTS)
-- Speaker diarization in transcription
-- Batch processing (multiple files at once)
-- Audio post-processing (noise reduction, normalization)
-- UI improvements and accessibility
-- Documentation and tutorials
-- Testing and bug reports
-- Packaging for different platforms
-
-### Reporting issues
-
-Found a bug or have a feature request? [Open an issue](https://github.com/0xBinayak/VocalFlow/issues) with:
-
-- What you expected vs. what happened
-- Steps to reproduce
-- Your OS, Python version, and GPU info
+Found a bug? [Open an issue](https://github.com/0xBinayak/VocalFlow/issues).
 
 ## License
 
