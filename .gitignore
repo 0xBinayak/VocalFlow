@@ -16,6 +16,9 @@ transcripts/
 *.mp3
 *.wav
 
+# Cached models
+models/
+
 # Session / history
 .sesskey
 history.json

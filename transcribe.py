@@ -2,9 +2,12 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 import torch
 import whisper
+
+_MODEL_DIR = str(Path(__file__).resolve().parent / "models" / "whisper")
 
 
 def get_device() -> str:
@@ -30,7 +33,7 @@ def transcribe_words(
     device = device or get_device()
 
     print(f"Loading Whisper '{model_size}' model on {device.upper()}...")
-    model = whisper.load_model(model_size, device=device)
+    model = whisper.load_model(model_size, device=device, download_root=_MODEL_DIR)
 
     print(f"Transcribing: {audio_path}")
     t0 = time.perf_counter()

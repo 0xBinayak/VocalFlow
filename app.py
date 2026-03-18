@@ -17,9 +17,11 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "audio"
 TRANSCRIPT_DIR = BASE_DIR / "transcripts"
 HISTORY_FILE = BASE_DIR / "history.json"
+MODEL_DIR = BASE_DIR / "models"
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 TRANSCRIPT_DIR.mkdir(exist_ok=True)
+MODEL_DIR.mkdir(exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # History helpers
@@ -83,6 +85,7 @@ def get_base_model():
             device_map="cuda:0",
             dtype=torch.bfloat16,
             attn_implementation="sdpa",
+            cache_dir=str(MODEL_DIR),
         )
         print("[model] Base model ready.")
     return _base_model
@@ -98,6 +101,7 @@ def get_design_model():
             device_map="cuda:0",
             dtype=torch.bfloat16,
             attn_implementation="sdpa",
+            cache_dir=str(MODEL_DIR),
         )
         print("[model] VoiceDesign model ready.")
     return _design_model
@@ -116,7 +120,7 @@ def get_whisper_model(size: str = "base"):
         import whisper
         device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"[model] Loading Whisper '{size}' on {device.upper()} ...")
-        _whisper_model = whisper.load_model(size, device=device)
+        _whisper_model = whisper.load_model(size, device=device, download_root=str(MODEL_DIR / "whisper"))
         _whisper_size = size
         print("[model] Whisper ready.")
     return _whisper_model
