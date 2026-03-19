@@ -23,6 +23,17 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 TRANSCRIPT_DIR.mkdir(exist_ok=True)
 MODEL_DIR.mkdir(exist_ok=True)
 
+
+def _local_snapshot(repo_id: str) -> str:
+    """Resolve a HF repo id to its local snapshot path, or return repo_id as fallback."""
+    d = MODEL_DIR / ("models--" + repo_id.replace("/", "--"))
+    refs = d / "refs" / "main"
+    if refs.exists():
+        snap = d / "snapshots" / refs.read_text(encoding="utf-8").strip()
+        if snap.exists():
+            return str(snap.resolve())
+    return repo_id
+
 # ---------------------------------------------------------------------------
 # History helpers
 # ---------------------------------------------------------------------------
@@ -72,39 +83,22 @@ def _find_entry(fname: str) -> dict | None:
 # TTS Model loading (lazy)
 # ---------------------------------------------------------------------------
 _base_model = None
-_design_model = None
 
 
 def get_base_model():
     global _base_model
     if _base_model is None:
         from qwen_tts import Qwen3TTSModel
-        print("[model] Loading Qwen3-TTS-12Hz-1.7B-Base ...")
+        path = _local_snapshot("Qwen/Qwen3-TTS-12Hz-1.7B-Base")
+        print(f"[model] Loading Base from {path}")
         _base_model = Qwen3TTSModel.from_pretrained(
-            "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+            path,
             device_map="cuda:0",
             dtype=torch.bfloat16,
             attn_implementation="sdpa",
-            cache_dir=str(MODEL_DIR),
         )
         print("[model] Base model ready.")
     return _base_model
-
-
-def get_design_model():
-    global _design_model
-    if _design_model is None:
-        from qwen_tts import Qwen3TTSModel
-        print("[model] Loading Qwen3-TTS-12Hz-1.7B-VoiceDesign ...")
-        _design_model = Qwen3TTSModel.from_pretrained(
-            "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
-            device_map="cuda:0",
-            dtype=torch.bfloat16,
-            attn_implementation="sdpa",
-            cache_dir=str(MODEL_DIR),
-        )
-        print("[model] VoiceDesign model ready.")
-    return _design_model
 
 
 # ---------------------------------------------------------------------------
@@ -175,9 +169,7 @@ a:hover{color:#a5b4fc}
     display:flex;align-items:center;justify-content:center;
     font-size:.65rem;font-weight:700;flex-shrink:0;margin-top:1px;
 }
-.si-icon.tts{background:#1e1b4b;color:#a78bfa}
 .si-icon.clone{background:#172554;color:#60a5fa}
-.si-icon.design{background:#1e1b4b;color:#a78bfa}
 .si-icon.transcribe{background:#052e16;color:#4ade80}
 .si-meta{flex:1;min-width:0}
 .si-text{font-size:.78rem;color:#d4d4d8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -237,18 +229,6 @@ textarea,input[type=text],select{
 }
 textarea:focus,input:focus,select:focus{outline:none;border-color:#818cf8;box-shadow:0 0 0 3px rgba(129,140,248,.12)}
 select{cursor:pointer}
-
-/* Voice sub-tabs */
-.tabs{display:flex;gap:2px;margin-bottom:14px;border-bottom:1px solid #27272a;padding-bottom:0}
-.tb{
-    padding:10px 18px;color:#a1a1aa;font-size:.875rem;font-weight:500;
-    cursor:pointer;border:none;background:none;
-    border-bottom:2px solid transparent;transition:all .15s;
-}
-.tb:hover{color:#f4f4f5}
-.tb.on{color:#818cf8;border-bottom-color:#818cf8}
-.tab-panel{display:none}
-.tab-panel.active{display:block}
 
 /* File input */
 input[type=file]{padding:6px;font-size:.85rem;color:#a1a1aa}
@@ -363,13 +343,6 @@ function togglePlay(uid, src) {
     el.innerHTML = '<audio src="' + src + '" controls autoplay></audio>';
     el.classList.add('open');
 }
-function switchVoiceTab(mode) {
-    document.querySelectorAll('.vtb').forEach(b => b.classList.remove('on'));
-    document.querySelectorAll('.voice-panel').forEach(p => p.classList.remove('active'));
-    document.querySelector('[data-vtab="'+mode+'"]').classList.add('on');
-    document.getElementById('vpanel-'+mode).classList.add('active');
-    document.getElementById('voice_mode').value = mode;
-}
 function switchPage(page) {
     document.querySelectorAll('.ptab').forEach(b => b.classList.remove('on'));
     document.querySelectorAll('.page-panel').forEach(p => p.classList.remove('active'));
@@ -406,14 +379,10 @@ def sidebar_item(entry: dict):
         icon_cls = "si-icon transcribe"
         icon_txt = "T"
         mode_label = "Transcribe"
-    elif mode == "clone":
+    else:
         icon_cls = "si-icon clone"
         icon_txt = "C"
         mode_label = "Clone"
-    else:
-        icon_cls = "si-icon design"
-        icon_txt = "D"
-        mode_label = "Design"
 
     voice = entry.get("voice", "")
     sub = f'{entry.get("time", "")}  ·  {mode_label}'
@@ -496,7 +465,7 @@ def sidebar_history():
 
 
 # ---------------------------------------------------------------------------
-# Page: TTS
+# Page: TTS (Voice Clone)
 # ---------------------------------------------------------------------------
 def tts_page():
     form = Form(
@@ -532,39 +501,19 @@ def tts_page():
             cls="cd",
         ),
         Div(
-            H3("Voice Source"),
-            Input(type="hidden", name="voice_mode", id="voice_mode", value="prompt"),
+            H3("Voice Reference"),
             Div(
-                A("Voice Design", cls="vtb on", data_vtab="prompt", onclick="switchVoiceTab('prompt')"),
-                A("Clone from Audio", cls="vtb", data_vtab="audio", onclick="switchVoiceTab('audio')"),
-                cls="tabs",
+                Label("Reference Audio File"),
+                Input(type="file", name="ref_audio", accept=".wav,.mp3,.flac,.ogg,audio/*", required=True),
+                cls="field",
             ),
             Div(
-                Div(
-                    Label("Describe the voice"),
-                    Textarea(
-                        name="voice_prompt", rows=3,
-                        placeholder="e.g. Young female voice, warm and cheerful, slight British accent...",
-                    ),
-                    cls="field",
+                Label("Transcript (recommended)"),
+                Textarea(
+                    name="ref_text", rows=2,
+                    placeholder="What the speaker says in the uploaded audio...",
                 ),
-                id="vpanel-prompt", cls="voice-panel active tab-panel",
-            ),
-            Div(
-                Div(
-                    Label("Reference Audio File"),
-                    Input(type="file", name="ref_audio", accept=".wav,.mp3,.flac,.ogg,audio/*"),
-                    cls="field",
-                ),
-                Div(
-                    Label("Transcript (recommended)"),
-                    Textarea(
-                        name="ref_text", rows=2,
-                        placeholder="What the speaker says in the uploaded audio...",
-                    ),
-                    cls="field",
-                ),
-                id="vpanel-audio", cls="voice-panel tab-panel",
+                cls="field",
             ),
             cls="cd",
         ),
@@ -671,57 +620,44 @@ def get():
 
 
 @rt("/generate")
-async def post(text: str, language: str, voice_mode: str,
-               voice_prompt: str = "", ref_text: str = "",
+async def post(text: str, language: str, ref_text: str = "",
                ref_audio: UploadFile = None):
     if not text.strip():
         return Div(P("Please enter some text to speak."), cls="err")
+    if not ref_audio or not ref_audio.filename:
+        return Div(P("Please upload a reference audio file."), cls="err")
 
     out_name = f"{uuid.uuid4().hex}.wav"
     out_path = OUTPUT_DIR / out_name
-    mode_label = "design"
-    voice_desc = ""
+    voice_desc = f"Cloned from {ref_audio.filename}"
+
+    ext = Path(ref_audio.filename).suffix.lower()
+    tmp_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{ext}"
+    content = await ref_audio.read()
+    tmp_path.write_bytes(content)
 
     try:
-        if voice_mode == "audio" and ref_audio and ref_audio.filename:
-            mode_label = "clone"
-            ext = Path(ref_audio.filename).suffix.lower()
-            tmp_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{ext}"
-            content = await ref_audio.read()
-            tmp_path.write_bytes(content)
-            voice_desc = f"Cloned from {ref_audio.filename}"
-
-            model = get_base_model()
-            wavs, sr = model.generate_voice_clone(
-                text=text.strip(),
-                language=language,
-                ref_audio=str(tmp_path),
-                ref_text=ref_text.strip() if ref_text.strip() else None,
-                x_vector_only_mode=not bool(ref_text.strip()),
-                max_new_tokens=2048,
-            )
-            sf.write(str(out_path), wavs[0], sr)
-            tmp_path.unlink(missing_ok=True)
-        else:
-            voice_desc = voice_prompt.strip() or "Natural, clear adult voice"
-            model = get_design_model()
-            wavs, sr = model.generate_voice_design(
-                text=text.strip(),
-                language=language,
-                instruct=voice_desc,
-                max_new_tokens=2048,
-            )
-            sf.write(str(out_path), wavs[0], sr)
-
+        model = get_base_model()
+        wavs, sr = model.generate_voice_clone(
+            text=text.strip(),
+            language=language,
+            ref_audio=str(tmp_path),
+            ref_text=ref_text.strip() if ref_text.strip() else None,
+            x_vector_only_mode=not bool(ref_text.strip()),
+            max_new_tokens=2048,
+        )
+        sf.write(str(out_path), wavs[0], sr)
+        tmp_path.unlink(missing_ok=True)
     except Exception as e:
         import traceback
         traceback.print_exc()
+        tmp_path.unlink(missing_ok=True)
         return Div(P(f"Generation failed: {e}"), cls="err")
 
     if not out_path.exists():
         return Div(P("Output file was not created. Please try again."), cls="err")
 
-    _add_history(out_name, text.strip(), mode_label, language, voice_desc)
+    _add_history(out_name, text.strip(), "clone", language, voice_desc)
     pretty_name = f"{_slug(text.strip())}.wav"
 
     return Div(

@@ -1,6 +1,6 @@
 <p align="center">
   <h1 align="center">VocalFlow</h1>
-  <p align="center">Local text-to-speech and audio transcription — all in one web app.</p>
+  <p align="center">Local voice cloning and audio transcription — all in one web app.</p>
 </p>
 
 <p align="center">
@@ -16,20 +16,17 @@
 
 VocalFlow is a self-hosted web application that runs entirely on your local machine. It provides two core capabilities:
 
-- **Text-to-Speech (TTS)** — generate speech with voice design or voice cloning
+- **Voice Cloning (TTS)** — upload a short reference audio clip and clone the speaker's voice for new text
 - **Audio Transcription** — transcribe audio files with word-level timestamps
 
 No cloud APIs. No data leaves your machine. Just your GPU doing the work.
 
 ## Features
 
-### Speech Generation (TTS)
+### Voice Cloning
 
-| Mode | Description |
-|------|-------------|
-| **Voice Design** | Describe the voice you want in natural language (age, accent, tone, emotion) and the model generates it |
-| **Voice Cloning** | Upload a short reference audio clip and clone the speaker's voice for new text |
-
+- Upload a reference audio clip (3-10 seconds) and clone the speaker's voice
+- Optionally provide a transcript of the reference audio for higher quality
 - 10+ languages: English, Chinese, Japanese, Korean, German, French, Russian, Portuguese, Spanish, Italian
 - Auto language detection
 - Download generated audio as `.wav`
@@ -37,8 +34,8 @@ No cloud APIs. No data leaves your machine. Just your GPU doing the work.
 ### Audio Transcription
 
 - Upload any audio file (`.wav`, `.mp3`, `.flac`, `.ogg`)
-- Choose from 6 Whisper model sizes (tiny → large) based on your speed/accuracy needs
-- Get full transcript with word-level timestamps
+- Choose from 6 Whisper model sizes (tiny to large) based on your speed/accuracy needs
+- Full transcript with word-level timestamps
 - Copy transcript to clipboard or download as structured JSON
 - Auto-detect language or specify manually
 
@@ -51,17 +48,14 @@ No cloud APIs. No data leaves your machine. Just your GPU doing the work.
 
 ## Models
 
-VocalFlow uses two open-source model families:
-
-### Qwen3-TTS (Text-to-Speech)
+### Qwen3-TTS (Voice Cloning)
 
 | Model | Parameters | Purpose |
 |-------|-----------|---------|
 | [Qwen3-TTS-12Hz-1.7B-Base](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) | 1.7B | Voice cloning from reference audio |
-| [Qwen3-TTS-12Hz-1.7B-VoiceDesign](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign) | 1.7B | Voice generation from text descriptions |
 
 - Runs in `bfloat16` with SDPA attention for efficient inference
-- Models are downloaded automatically on first use (~3.5 GB each)
+- Downloaded automatically on first use (~3.5 GB)
 - Requires a CUDA GPU with at least 6 GB VRAM
 
 ### OpenAI Whisper (Transcription)
@@ -116,8 +110,10 @@ uv run app.py
 VocalFlow/
 ├── app.py              # Main web application (FastHTML + routes + UI)
 ├── transcribe.py       # Whisper transcription module (also usable as CLI)
+├── main.py             # CLI entry points (vocalflow, vocalflow-transcribe)
 ├── pyproject.toml      # Dependencies and build config
 ├── uv.lock             # Locked dependency versions
+├── models/             # Cached model weights (gitignored, created at runtime)
 ├── audio/              # Generated speech files (gitignored, created at runtime)
 ├── uploads/            # Temporary uploaded files (gitignored, created at runtime)
 ├── transcripts/        # Transcription JSON files (gitignored, created at runtime)
@@ -136,7 +132,7 @@ Contributions are welcome!
 3. Create a branch, make changes, ensure `uvx ruff check app.py transcribe.py main.py` passes
 4. Open a Pull Request against `main`
 
-**Areas where help is appreciated:** additional TTS backends (Bark, StyleTTS2, F5-TTS), speaker diarization, batch processing, audio post-processing, UI improvements, and testing.
+**Areas where help is appreciated:** additional TTS backends, speaker diarization, batch processing, audio post-processing, UI improvements, and testing.
 
 Found a bug? [Open an issue](https://github.com/0xBinayak/VocalFlow/issues).
 
@@ -146,7 +142,7 @@ MIT
 
 ## Acknowledgments
 
-- [Qwen3-TTS](https://huggingface.co/Qwen) by Alibaba Cloud — text-to-speech models
+- [Qwen3-TTS](https://huggingface.co/Qwen) by Alibaba Cloud — voice cloning model
 - [OpenAI Whisper](https://github.com/openai/whisper) — speech recognition
 - [FastHTML](https://github.com/AnswerDotAI/fasthtml) — Python web framework
 - [HTMX](https://htmx.org/) — frontend interactivity
