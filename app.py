@@ -293,9 +293,9 @@ def render_history_html() -> str:
         # Build download link
         fname = e.get("file", "")
         if mode == "transcribe":
-            dl_path = f"/file={TRANSCRIPT_DIR / fname}"
+            dl_path = "/gradio_api/file=" + (TRANSCRIPT_DIR / fname).as_posix()
         else:
-            dl_path = f"/file={OUTPUT_DIR / fname}"
+            dl_path = "/gradio_api/file=" + (OUTPUT_DIR / fname).as_posix()
         dl_btn = (
             f'<a class="si-dl" href="{dl_path}" download="{fname}" '
             f'title="Download">\u2913</a>'
@@ -1082,11 +1082,5 @@ with gr.Blocks(title="VocalFlow") as app:
 
 
 if __name__ == "__main__":
-    app.launch(
-        server_name="127.0.0.1",
-        server_port=5001,
-        allowed_paths=[str(OUTPUT_DIR), str(TRANSCRIPT_DIR)],
-        css=CUSTOM_CSS,
-        js=DELETE_JS,
-        theme=theme,
-    )
+    from main import _launch_kwargs
+    app.launch(**_launch_kwargs())
