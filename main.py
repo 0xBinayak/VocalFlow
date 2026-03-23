@@ -1,7 +1,7 @@
 def main():
     """Entry point for `vocalflow` CLI command."""
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=5001, reload=True)
+    from app import app
+    app.launch(server_name="127.0.0.1", server_port=5001)
 
 
 def transcribe_cli():

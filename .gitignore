@@ -9,10 +9,11 @@ wheels/
 # Virtual environments
 .venv
 
-# Generated audio, uploads & transcripts
+# Generated audio, uploads, transcripts & saved voices
 audio/
 uploads/
 transcripts/
+voices/
 *.mp3
 *.wav
 
@@ -26,6 +27,7 @@ history.json
 # IDE / editor
 .vscode/
 .idea/
+.claude/
 
 # OS
 Thumbs.db

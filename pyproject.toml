@@ -1,22 +1,24 @@
 [project]
 name = "vocalflow"
-version = "0.3.2"
+version = "0.6.0"
 description = "Local TTS and audio transcription web app"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = "==3.11.*"
 dependencies = [
+    "flash-attn",
+    "gradio>=5.0",
     "openai-whisper>=20231117",
-    "python-fasthtml>=0.12.50",
-    "python-multipart>=0.0.22",
     "qwen-tts>=0.1.1",
     "soundfile>=0.13.1",
     "torch>=2.10.0",
     "torchaudio>=2.10.0",
+    "triton-windows>=3.6.0.post26",
 ]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu126" }
 torchaudio = { index = "pytorch-cu126" }
+flash-attn = { url = "https://github.com/deepbeepmeep/kernels/releases/download/Flash2/flash_attn-2.8.3-cp311-cp311-win_amd64.whl" }
 
 [[tool.uv.index]]
 name = "pytorch-cu126"

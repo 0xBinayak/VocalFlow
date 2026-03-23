@@ -1,13 +1,34 @@
+import gc
+import os
 import re
 import uuid
 import json
 import time
-import torch
-import soundfile as sf
+from dataclasses import asdict
 from pathlib import Path
 from datetime import datetime
-from starlette.staticfiles import StaticFiles
-from fasthtml.common import *
+
+# The `sox` Python package (pulled in by qwen-tts) checks for the SoX binary
+# at import time via os.popen, which on Windows goes through cmd.exe and fails
+# when cmd AutoRun is set (DOSKEY etc.).  We detect SoX reliably with
+# shutil.which, then import sox with stderr silenced and fix the flag.
+import shutil
+if shutil.which("sox"):
+    import contextlib, subprocess
+    with open(os.devnull, "w") as _devnull, contextlib.redirect_stderr(_devnull):
+        # Monkey-patch os.popen for the duration of the sox import so the
+        # broken cmd.exe check doesn't spam the console.
+        _orig_popen = os.popen
+        os.popen = lambda *a, **k: subprocess.Popen(
+            ["sox", "-h"], stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        ).stdout
+        import sox as _sox_mod
+        os.popen = _orig_popen
+    _sox_mod.NO_SOX = False
+
+import torch
+import gradio as gr
+import soundfile as sf
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -16,11 +37,13 @@ BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 OUTPUT_DIR = BASE_DIR / "audio"
 TRANSCRIPT_DIR = BASE_DIR / "transcripts"
+VOICES_DIR = BASE_DIR / "voices"
 HISTORY_FILE = BASE_DIR / "history.json"
 MODEL_DIR = BASE_DIR / "models"
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 TRANSCRIPT_DIR.mkdir(exist_ok=True)
+VOICES_DIR.mkdir(exist_ok=True)
 MODEL_DIR.mkdir(exist_ok=True)
 
 
@@ -33,6 +56,7 @@ def _local_snapshot(repo_id: str) -> str:
         if snap.exists():
             return str(snap.resolve())
     return repo_id
+
 
 # ---------------------------------------------------------------------------
 # History helpers
@@ -64,41 +88,87 @@ def _add_history(filename: str, text: str, mode: str, language: str, voice_desc:
 
 
 def _slug(text: str, max_len: int = 50) -> str:
-    """Turn text into a safe filename slug."""
     s = text.strip()[:max_len].lower()
     s = re.sub(r'[^\w\s-]', '', s)
     s = re.sub(r'[\s_]+', '-', s).strip('-')
     return s or "untitled"
 
 
-def _find_entry(fname: str) -> dict | None:
-    """Look up a history entry by internal filename."""
-    for e in _load_history():
-        if e.get("file") == fname:
-            return e
-    return None
-
-
 # ---------------------------------------------------------------------------
-# TTS Model loading (lazy)
+# TTS Model loading (lazy, per model type + size)
+# Automatic unload: only one model (TTS or Whisper) is kept in memory at a
+# time.  Switching between models triggers an automatic unload of the
+# previous one so VRAM is reclaimed without manual intervention.
 # ---------------------------------------------------------------------------
-_base_model = None
+_models = {}
+_active_tts_key = None          # track which TTS model is currently loaded
+
+MODEL_REPO_MAP = {
+    ("base", "1.7B"): "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+    ("base", "0.6B"): "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+    ("custom_voice", "1.7B"): "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    ("custom_voice", "0.6B"): "Qwen/Qwen3-TTS-12Hz-0.6B-CustomVoice",
+    ("voice_design", "1.7B"): "Qwen/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+}
 
 
-def get_base_model():
-    global _base_model
-    if _base_model is None:
-        from qwen_tts import Qwen3TTSModel
-        path = _local_snapshot("Qwen/Qwen3-TTS-12Hz-1.7B-Base")
-        print(f"[model] Loading Base from {path}")
-        _base_model = Qwen3TTSModel.from_pretrained(
-            path,
-            device_map="cuda:0",
-            dtype=torch.bfloat16,
-            attn_implementation="sdpa",
-        )
-        print("[model] Base model ready.")
-    return _base_model
+def _release_gpu():
+    """Run garbage collection and release cached CUDA memory."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _unload_tts(reason: str = ""):
+    """Unload the currently loaded TTS model (if any) and free VRAM."""
+    global _active_tts_key
+    if _active_tts_key is not None and _active_tts_key in _models:
+        label = f"{_active_tts_key[0]} {_active_tts_key[1]}"
+        del _models[_active_tts_key]
+        _active_tts_key = None
+        _release_gpu()
+        print(f"[model] Auto-unloaded TTS ({label}){f' — {reason}' if reason else ''}")
+
+
+def _unload_whisper(reason: str = ""):
+    """Unload the currently loaded Whisper model (if any) and free VRAM."""
+    global _whisper_model, _whisper_size
+    if _whisper_model is not None:
+        old_size = _whisper_size
+        _whisper_model = None
+        _whisper_size = None
+        _release_gpu()
+        print(f"[model] Auto-unloaded Whisper ({old_size}){f' — {reason}' if reason else ''}")
+
+
+def get_tts_model(model_type: str, model_size: str):
+    global _active_tts_key
+    key = (model_type, model_size)
+
+    # Already loaded — nothing to do
+    if key == _active_tts_key and key in _models:
+        return _models[key]
+
+    repo_id = MODEL_REPO_MAP.get(key)
+    if repo_id is None:
+        raise gr.Error(f"No model available for {model_type} / {model_size}")
+
+    # --- automatic unload before loading the new model ---
+    _unload_whisper(reason=f"switching to TTS {model_type} {model_size}")
+    _unload_tts(reason=f"switching to {model_type} {model_size}")
+
+    from qwen_tts import Qwen3TTSModel
+    path = _local_snapshot(repo_id)
+    print(f"[model] Loading {model_type} {model_size} from {path}")
+    _models[key] = Qwen3TTSModel.from_pretrained(
+        path,
+        device_map="cuda:0",
+        dtype=torch.bfloat16,
+        attn_implementation="sdpa",
+    )
+    _active_tts_key = key
+    print(f"[model] {model_type} {model_size} ready.")
+    return _models[key]
 
 
 # ---------------------------------------------------------------------------
@@ -110,589 +180,349 @@ _whisper_size = None
 
 def get_whisper_model(size: str = "base"):
     global _whisper_model, _whisper_size
-    if _whisper_model is None or _whisper_size != size:
-        import whisper
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"[model] Loading Whisper '{size}' on {device.upper()} ...")
-        _whisper_model = whisper.load_model(size, device=device, download_root=str(MODEL_DIR / "whisper"))
-        _whisper_size = size
-        print("[model] Whisper ready.")
+
+    # Already loaded at the requested size — nothing to do
+    if _whisper_model is not None and _whisper_size == size:
+        return _whisper_model
+
+    # --- automatic unload before loading the new model ---
+    _unload_tts(reason=f"switching to Whisper {size}")
+    _unload_whisper(reason=f"switching to Whisper {size}")
+
+    import whisper
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"[model] Loading Whisper '{size}' on {device.upper()} ...")
+    _whisper_model = whisper.load_model(size, device=device, download_root=str(MODEL_DIR / "whisper"))
+    _whisper_size = size
+    print("[model] Whisper ready.")
     return _whisper_model
 
 
 # ---------------------------------------------------------------------------
-# CSS
+# Unload all models from GPU
 # ---------------------------------------------------------------------------
-CSS = """
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
-*{box-sizing:border-box;margin:0;padding:0}
-html{font-size:15px}
-body{font-family:'Inter',system-ui,sans-serif;background:#09090b;color:#e4e4e7;min-height:100vh;line-height:1.6}
-a{color:#818cf8;text-decoration:none}
-a:hover{color:#a5b4fc}
-
-/* Layout: sidebar + main */
-.layout{display:flex;min-height:100vh}
-
-/* Sidebar */
-.sidebar{
-    width:300px;min-width:300px;
-    background:#111113;border-right:1px solid #27272a;
-    display:flex;flex-direction:column;
-    overflow:hidden;
-}
-.sidebar-brand{
-    padding:20px;border-bottom:1px solid #27272a;
-    text-align:center;
-}
-.sidebar-brand h1{font-size:1.2rem;font-weight:700;color:#f4f4f5;letter-spacing:-.02em}
-.sidebar-brand p{color:#52525b;font-size:.72rem;margin-top:2px}
-.sidebar-hist{flex:1;overflow-y:auto;padding:12px}
-.sidebar-hist::-webkit-scrollbar{width:4px}
-.sidebar-hist::-webkit-scrollbar-thumb{background:#27272a;border-radius:4px}
-.sidebar-hdr{
-    display:flex;align-items:center;justify-content:space-between;
-    margin-bottom:10px;padding:0 4px;
-}
-.sidebar-hdr h3{font-size:.7rem;font-weight:600;color:#71717a;text-transform:uppercase;letter-spacing:.5px;margin:0}
-.sidebar-count{font-size:.68rem;color:#52525b}
-
-.si{
-    display:flex;align-items:flex-start;gap:10px;
-    padding:10px 12px;
-    background:#18181b;border:1px solid transparent;border-radius:8px;
-    margin-bottom:4px;transition:all .15s;cursor:default;
-}
-.si:hover{border-color:#27272a;background:#1c1c1f}
-.si-icon{
-    width:26px;height:26px;border-radius:6px;
-    display:flex;align-items:center;justify-content:center;
-    font-size:.65rem;font-weight:700;flex-shrink:0;margin-top:1px;
-}
-.si-icon.clone{background:#172554;color:#60a5fa}
-.si-icon.transcribe{background:#052e16;color:#4ade80}
-.si-meta{flex:1;min-width:0}
-.si-text{font-size:.78rem;color:#d4d4d8;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.si-sub{font-size:.65rem;color:#52525b;margin-top:1px}
-.si-actions{display:flex;gap:3px;flex-shrink:0;margin-top:2px}
-.si-btn{
-    padding:3px 8px;border-radius:5px;font-size:.65rem;font-weight:500;
-    text-decoration:none;border:1px solid #27272a;background:none;cursor:pointer;
-    transition:all .15s;color:#a1a1aa;
-}
-.si-btn:hover{background:#27272a;color:#f4f4f5}
-.si-btn.play{color:#4ade80}
-.si-btn.play:hover{background:#052e16;border-color:#166534}
-.si-btn.dl{color:#818cf8}
-.si-btn.dl:hover{background:#1e1b4b;border-color:#818cf8}
-.si-player{overflow:hidden;max-height:0;transition:max-height .25s ease}
-.si-player.open{max-height:60px;padding:4px 12px 6px}
-.si-player audio{width:100%;height:32px;border-radius:6px}
-.sidebar-empty{
-    text-align:center;color:#52525b;font-size:.78rem;
-    padding:30px 16px;
-}
-
-/* Main content */
-.main{flex:1;overflow-y:auto;padding:32px 40px;max-width:900px}
-.main-hdr{margin-bottom:24px}
-.main-hdr h2{font-size:1.4rem;font-weight:700;color:#f4f4f5;letter-spacing:-.01em}
-.main-hdr p{color:#71717a;font-size:.85rem;margin-top:2px}
-
-/* Page tabs */
-.page-tabs{display:flex;gap:2px;margin-bottom:24px;border-bottom:1px solid #27272a}
-.ptab{
-    padding:10px 20px;color:#71717a;font-size:.88rem;font-weight:500;
-    cursor:pointer;border:none;background:none;
-    border-bottom:2px solid transparent;transition:all .15s;
-}
-.ptab:hover{color:#e4e4e7}
-.ptab.on{color:#818cf8;border-bottom-color:#818cf8}
-.page-panel{display:none}
-.page-panel.active{display:block}
-
-/* Cards */
-.cd{background:#18181b;border:1px solid #27272a;border-radius:10px;padding:20px;margin-bottom:16px}
-.cd:hover{border-color:#3f3f46}
-.cd h3{font-size:.8rem;font-weight:600;color:#a1a1aa;margin-bottom:12px;text-transform:uppercase;letter-spacing:.4px}
-
-/* Form fields */
-.field{margin-bottom:14px}
-.field:last-child{margin-bottom:0}
-label{display:block;font-weight:500;margin-bottom:4px;color:#a1a1aa;font-size:.8rem;text-transform:uppercase;letter-spacing:.4px}
-textarea,input[type=text],select{
-    width:100%;padding:10px 14px;
-    border:1px solid #27272a;border-radius:8px;
-    background:#09090b;color:#e4e4e7;
-    font-size:.9rem;font-family:inherit;resize:vertical;
-    transition:border-color .15s,box-shadow .15s;
-}
-textarea:focus,input:focus,select:focus{outline:none;border-color:#818cf8;box-shadow:0 0 0 3px rgba(129,140,248,.12)}
-select{cursor:pointer}
-
-/* File input */
-input[type=file]{padding:6px;font-size:.85rem;color:#a1a1aa}
-input[type=file]::file-selector-button{
-    background:#27272a;color:#818cf8;
-    border:1px solid #3f3f46;padding:6px 14px;
-    border-radius:6px;cursor:pointer;margin-right:8px;
-    font-weight:500;font-size:.82rem;transition:background .15s;
-}
-input[type=file]::file-selector-button:hover{background:#3f3f46}
-
-/* Buttons */
-.btn-gen{
-    display:block;width:100%;padding:12px;margin-top:8px;
-    background:#818cf8;color:#09090b;
-    border:none;border-radius:8px;
-    font-size:.95rem;font-weight:700;cursor:pointer;
-    letter-spacing:.3px;transition:all .15s;
-}
-.btn-gen:hover{background:#a5b4fc}
-.btn-gen:active{transform:scale(.99)}
-.btn-gen:disabled{opacity:.35;cursor:not-allowed;transform:none}
-
-.btn-transcribe{
-    display:block;width:100%;padding:12px;margin-top:8px;
-    background:#4ade80;color:#09090b;
-    border:none;border-radius:8px;
-    font-size:.95rem;font-weight:700;cursor:pointer;
-    letter-spacing:.3px;transition:all .15s;
-}
-.btn-transcribe:hover{background:#86efac}
-.btn-transcribe:active{transform:scale(.99)}
-.btn-transcribe:disabled{opacity:.35;cursor:not-allowed;transform:none}
-
-/* Result */
-#tts-result,#transcribe-result{margin-top:16px}
-.result-ok{
-    background:#052e16;border:1px solid #166534;
-    border-radius:10px;padding:16px 20px;
-}
-.result-ok .status{color:#4ade80;font-weight:600;font-size:.85rem;margin-bottom:8px}
-audio{width:100%;border-radius:6px;margin:6px 0}
-.dl-link{
-    display:inline-block;margin-top:6px;
-    color:#818cf8;font-size:.82rem;font-weight:500;
-    transition:color .15s;
-}
-.dl-link:hover{color:#a5b4fc}
-
-/* Transcript result */
-.transcript-box{
-    background:#18181b;border:1px solid #27272a;
-    border-radius:10px;padding:16px 20px;
-    max-height:400px;overflow-y:auto;
-}
-.transcript-box pre{
-    font-family:'Inter',system-ui,sans-serif;
-    font-size:.88rem;color:#e4e4e7;
-    white-space:pre-wrap;word-wrap:break-word;
-    line-height:1.7;
-}
-.transcript-meta{
-    font-size:.75rem;color:#71717a;margin-top:8px;
-    padding-top:8px;border-top:1px solid #27272a;
-}
-.transcript-actions{display:flex;gap:8px;margin-top:10px}
-.transcript-actions .dl-link{font-size:.78rem}
-
-/* Error */
-.err{
-    background:#450a0a;border:1px solid #7f1d1d;
-    border-radius:10px;padding:14px 18px;
-    color:#f87171;font-size:.88rem;
-}
-
-/* Spinner */
-.htmx-indicator{display:none}
-.htmx-request .htmx-indicator,.htmx-request.htmx-indicator{display:block}
-.sp-wrap{text-align:center;padding:20px}
-.sp{
-    display:inline-block;width:16px;height:16px;
-    border:2px solid #27272a;border-top-color:#818cf8;
-    border-radius:50%;animation:spin .5s linear infinite;
-    vertical-align:middle;margin-right:8px;
-}
-@keyframes spin{to{transform:rotate(360deg)}}
-.sp-text{color:#71717a;font-size:.88rem}
-
-/* Animation */
-.fi{animation:fi .3s ease}
-@keyframes fi{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
-
-/* Responsive */
-@media(max-width:768px){
-    .layout{flex-direction:column}
-    .sidebar{width:100%;min-width:100%;max-height:200px;border-right:none;border-bottom:1px solid #27272a}
-    .main{padding:20px}
-}
-"""
-
-JS = """
-function togglePlay(uid, src) {
-    var el = document.getElementById('player-' + uid);
-    if (el.classList.contains('open')) {
-        el.classList.remove('open');
-        el.innerHTML = '';
-        return;
-    }
-    document.querySelectorAll('.si-player.open').forEach(function(p) {
-        p.classList.remove('open'); p.innerHTML = '';
-    });
-    el.innerHTML = '<audio src="' + src + '" controls autoplay></audio>';
-    el.classList.add('open');
-}
-function switchPage(page) {
-    document.querySelectorAll('.ptab').forEach(b => b.classList.remove('on'));
-    document.querySelectorAll('.page-panel').forEach(p => p.classList.remove('active'));
-    document.querySelector('[data-page="'+page+'"]').classList.add('on');
-    document.getElementById('page-'+page).classList.add('active');
-}
-function copyTranscript() {
-    var el = document.getElementById('transcript-text');
-    if (el) {
-        navigator.clipboard.writeText(el.innerText);
-        var btn = document.getElementById('copy-btn');
-        btn.innerText = 'Copied!';
-        setTimeout(function(){ btn.innerText = 'Copy'; }, 1500);
-    }
-}
-"""
-
-# ---------------------------------------------------------------------------
-# FastHTML app
-# ---------------------------------------------------------------------------
-app, rt = fast_app(hdrs=[Style(CSS), Script(JS)])
-app.mount("/audio", StaticFiles(directory=str(OUTPUT_DIR)), name="audio_static")
+def unload_all_models():
+    global _active_tts_key
+    count = len(_models) + (1 if _whisper_model is not None else 0)
+    if count == 0:
+        return 0
+    _unload_tts()
+    _unload_whisper()
+    _models.clear()
+    _active_tts_key = None
+    _release_gpu()
+    print(f"[model] Unloaded {count} model(s), GPU memory released.")
+    return count
 
 
 # ---------------------------------------------------------------------------
-# Sidebar components
+# Clear history + associated files + unload models
 # ---------------------------------------------------------------------------
-def sidebar_item(entry: dict):
-    fname = entry["file"]
-    mode = entry.get("mode", "")
-    is_transcribe = mode == "transcribe"
-
-    if is_transcribe:
-        icon_cls = "si-icon transcribe"
-        icon_txt = "T"
-        mode_label = "Transcribe"
-    else:
-        icon_cls = "si-icon clone"
-        icon_txt = "C"
-        mode_label = "Clone"
-
-    voice = entry.get("voice", "")
-    sub = f'{entry.get("time", "")}  ·  {mode_label}'
-    lang = entry.get("language", "")
-    if lang:
-        sub += f"  ·  {lang}"
-    if voice:
-        sub += f"  ·  {voice[:30]}"
-
-    uid = fname.replace(".", "_")
-
-    if is_transcribe:
-        json_name = fname
-        exists = (TRANSCRIPT_DIR / json_name).exists()
-        if exists:
-            actions = Div(
-                A(NotStr("&#8681;"), href=f"/transcript/{json_name.removesuffix('.json')}", cls="si-btn dl", title="Download"),
-                cls="si-actions",
-            )
-        else:
-            actions = Div()
-        return Div(
-            Div(icon_txt, cls=icon_cls),
-            Div(
-                Div(entry.get("text", "—"), cls="si-text"),
-                Div(sub, cls="si-sub"),
-                cls="si-meta",
-            ),
-            actions,
-            cls="si",
-        )
-
-    exists = (OUTPUT_DIR / fname).exists()
-    if exists:
-        actions = Div(
-            Button("Play", onclick=f"togglePlay('{uid}','/audio/{fname}')", cls="si-btn play"),
-            A(NotStr("&#8681;"), href=f"/download/{fname.removesuffix('.wav')}", download=f"{_slug(entry.get('text', 'audio'))}.wav", cls="si-btn dl", title="Download"),
-            cls="si-actions",
-        )
-        player = Div(id=f"player-{uid}", cls="si-player")
-    else:
-        actions = Div()
-        player = None
-
-    row = Div(
-        Div(icon_txt, cls=icon_cls),
-        Div(
-            Div(entry.get("text", "—"), cls="si-text"),
-            Div(sub, cls="si-sub"),
-            cls="si-meta",
-        ),
-        actions,
-        cls="si", id=f"si-{uid}",
-    )
-    if player:
-        return Div(row, player)
-    return row
+def delete_history_item(filename: str) -> str:
+    """Delete a single history entry and its associated file."""
+    if not filename:
+        return render_history_html()
+    entries = _load_history()
+    new_entries = [e for e in entries if e.get("file") != filename]
+    if len(new_entries) < len(entries):
+        for d in (OUTPUT_DIR, TRANSCRIPT_DIR):
+            p = d / filename
+            if p.exists():
+                p.unlink()
+        _save_history(new_entries)
+        print(f"[history] Deleted item: {filename}")
+    return render_history_html()
 
 
-def sidebar_history():
+def clear_history_and_files():
+    entries = _load_history()
+    deleted_files = 0
+    for e in entries:
+        fname = e.get("file", "")
+        if not fname:
+            continue
+        for d in (OUTPUT_DIR, TRANSCRIPT_DIR):
+            p = d / fname
+            if p.exists():
+                p.unlink()
+                deleted_files += 1
+    for f in UPLOAD_DIR.iterdir():
+        if f.is_file():
+            f.unlink()
+            deleted_files += 1
+    _save_history([])
+    print(f"[clear] Deleted {deleted_files} file(s).")
+    return render_history_html()
+
+
+# ---------------------------------------------------------------------------
+# History rendering (HTML for sidebar)
+# ---------------------------------------------------------------------------
+MODE_DISPLAY = {
+    "clone": ("C", "clone", "Clone"),
+    "custom_voice": ("S", "custom-voice", "Custom Voice"),
+    "voice_design": ("D", "design", "Voice Design"),
+    "transcribe": ("T", "transcribe", "Transcribe"),
+}
+
+
+def render_history_html() -> str:
     entries = _load_history()
     if not entries:
-        return Div(
-            Div(
-                Div(H3("History"), cls="sidebar-hdr"),
-                Div("No activity yet.", cls="sidebar-empty"),
-            ),
-            id="sidebar-history",
-        )
-    items = [sidebar_item(e) for e in entries[:30]]
-    return Div(
-        Div(
-            H3("History"),
-            Span(f"{len(entries)}", cls="sidebar-count"),
-            cls="sidebar-hdr",
-        ),
-        *items,
-        id="sidebar-history",
-    )
+        return '<div class="hist-empty">No activity yet.</div>'
+
+    items = []
+    for e in entries[:30]:
+        mode = e.get("mode", "")
+        icon, icon_cls, mode_label = MODE_DISPLAY.get(mode, ("?", "clone", mode))
+
+        sub_parts = [e.get("time", ""), mode_label]
+        lang = e.get("language", "")
+        if lang:
+            sub_parts.append(lang)
+        voice = e.get("voice", "")
+        if voice:
+            sub_parts.append(voice[:30])
+        sub = "  \u00b7  ".join(sub_parts)
+
+        text_display = e.get("text", "\u2014")
+        text_display = text_display.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        sub = sub.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        # Build download link
+        fname = e.get("file", "")
+        if mode == "transcribe":
+            dl_path = f"/file={TRANSCRIPT_DIR / fname}"
+        else:
+            dl_path = f"/file={OUTPUT_DIR / fname}"
+        dl_btn = (
+            f'<a class="si-dl" href="{dl_path}" download="{fname}" '
+            f'title="Download">\u2913</a>'
+        ) if fname else ""
+        del_btn = (
+            f'<button class="si-del" onclick="deleteHistoryItem(\'{fname}\')" '
+            f'title="Delete">\u00d7</button>'
+        ) if fname else ""
+
+        items.append(f'''<div class="si">
+            <div class="si-icon {icon_cls}">{icon}</div>
+            <div class="si-meta">
+                <div class="si-text">{text_display}</div>
+                <div class="si-sub">{sub}</div>
+            </div>
+            {dl_btn}
+            {del_btn}
+        </div>''')
+
+    count = len(entries)
+    return f'''<div class="sidebar-hdr">
+        <h3>History</h3><span class="sidebar-count">{count}</span>
+    </div>{''.join(items)}'''
 
 
 # ---------------------------------------------------------------------------
-# Page: TTS (Voice Clone)
+# Generate speech: Voice Clone (Base model)
 # ---------------------------------------------------------------------------
-def tts_page():
-    form = Form(
-        Div(
-            H3("Input"),
-            Div(
-                Label("Text to Speak"),
-                Textarea(
-                    name="text", rows=4,
-                    placeholder="Enter the text you want to convert to speech...",
-                    required=True,
-                ),
-                cls="field",
-            ),
-            Div(
-                Label("Language"),
-                Select(
-                    Option("Auto", value="Auto"),
-                    Option("English", value="English", selected=True),
-                    Option("Chinese", value="Chinese"),
-                    Option("Japanese", value="Japanese"),
-                    Option("Korean", value="Korean"),
-                    Option("German", value="German"),
-                    Option("French", value="French"),
-                    Option("Russian", value="Russian"),
-                    Option("Portuguese", value="Portuguese"),
-                    Option("Spanish", value="Spanish"),
-                    Option("Italian", value="Italian"),
-                    name="language",
-                ),
-                cls="field",
-            ),
-            cls="cd",
-        ),
-        Div(
-            H3("Voice Reference"),
-            Div(
-                Label("Reference Audio File"),
-                Input(type="file", name="ref_audio", accept=".wav,.mp3,.flac,.ogg,audio/*", required=True),
-                cls="field",
-            ),
-            Div(
-                Label("Transcript (recommended)"),
-                Textarea(
-                    name="ref_text", rows=2,
-                    placeholder="What the speaker says in the uploaded audio...",
-                ),
-                cls="field",
-            ),
-            cls="cd",
-        ),
-        Button("Generate Speech", cls="btn-gen", type="submit"),
-        hx_post="/generate",
-        hx_target="#tts-result",
-        hx_indicator="#tts-spinner",
-        hx_encoding="multipart/form-data",
-        hx_disabled_elt=".btn-gen",
-    )
-
-    spinner = Div(
-        Div(Span(cls="sp"), Span("Generating speech...", cls="sp-text"), cls="sp-wrap"),
-        id="tts-spinner", cls="htmx-indicator",
-    )
-    result = Div(id="tts-result")
-    return Div(form, spinner, result)
-
-
-# ---------------------------------------------------------------------------
-# Page: Transcribe
-# ---------------------------------------------------------------------------
-def transcribe_page():
-    form = Form(
-        Div(
-            H3("Transcribe Audio"),
-            Div(
-                Label("Audio File"),
-                Input(type="file", name="audio_file", accept=".wav,.mp3,.flac,.ogg,audio/*", required=True),
-                cls="field",
-            ),
-            Div(
-                Label("Whisper Model"),
-                Select(
-                    Option("tiny (fastest)", value="tiny"),
-                    Option("base (default)", value="base", selected=True),
-                    Option("small", value="small"),
-                    Option("medium", value="medium"),
-                    Option("large (best)", value="large"),
-                    Option("turbo", value="turbo"),
-                    name="whisper_model",
-                ),
-                cls="field",
-            ),
-            Div(
-                Label("Language (optional)"),
-                Select(
-                    Option("Auto-detect", value=""),
-                    Option("English", value="en"),
-                    Option("Chinese", value="zh"),
-                    Option("Japanese", value="ja"),
-                    Option("Korean", value="ko"),
-                    Option("German", value="de"),
-                    Option("French", value="fr"),
-                    Option("Russian", value="ru"),
-                    Option("Portuguese", value="pt"),
-                    Option("Spanish", value="es"),
-                    Option("Italian", value="it"),
-                    name="whisper_lang",
-                ),
-                cls="field",
-            ),
-            cls="cd",
-        ),
-        Button("Transcribe", cls="btn-transcribe", type="submit"),
-        hx_post="/transcribe",
-        hx_target="#transcribe-result",
-        hx_indicator="#transcribe-spinner",
-        hx_encoding="multipart/form-data",
-        hx_disabled_elt=".btn-transcribe",
-    )
-
-    spinner = Div(
-        Div(Span(cls="sp"), Span("Transcribing audio...", cls="sp-text"), cls="sp-wrap"),
-        id="transcribe-spinner", cls="htmx-indicator",
-    )
-    result = Div(id="transcribe-result")
-    return Div(form, spinner, result)
-
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
-@rt("/")
-def get():
-    sidebar = Div(
-        Div(H1("VocalFlow"), P("TTS & Transcription"), cls="sidebar-brand"),
-        Div(sidebar_history(), cls="sidebar-hist"),
-        cls="sidebar",
-    )
-
-    main = Div(
-        Div(
-            A("Speech", cls="ptab on", data_page="tts", onclick="switchPage('tts')"),
-            A("Transcribe", cls="ptab", data_page="transcribe", onclick="switchPage('transcribe')"),
-            cls="page-tabs",
-        ),
-        Div(tts_page(), id="page-tts", cls="page-panel active"),
-        Div(transcribe_page(), id="page-transcribe", cls="page-panel"),
-        cls="main",
-    )
-
-    return Title("VocalFlow"), Div(sidebar, main, cls="layout")
-
-
-@rt("/generate")
-async def post(text: str, language: str, ref_text: str = "",
-               ref_audio: UploadFile = None):
-    if not text.strip():
-        return Div(P("Please enter some text to speak."), cls="err")
-    if not ref_audio or not ref_audio.filename:
-        return Div(P("Please upload a reference audio file."), cls="err")
+def generate_speech(text, language, ref_audio, ref_text, model_size):
+    if not text or not text.strip():
+        raise gr.Error("Please enter some text to speak.")
+    if ref_audio is None:
+        raise gr.Error("Please upload a reference audio file.")
 
     out_name = f"{uuid.uuid4().hex}.wav"
     out_path = OUTPUT_DIR / out_name
-    voice_desc = f"Cloned from {ref_audio.filename}"
-
-    ext = Path(ref_audio.filename).suffix.lower()
-    tmp_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{ext}"
-    content = await ref_audio.read()
-    tmp_path.write_bytes(content)
+    voice_desc = f"Cloned · {model_size}"
 
     try:
-        model = get_base_model()
+        model = get_tts_model("base", model_size)
         wavs, sr = model.generate_voice_clone(
             text=text.strip(),
             language=language,
-            ref_audio=str(tmp_path),
-            ref_text=ref_text.strip() if ref_text.strip() else None,
-            x_vector_only_mode=not bool(ref_text.strip()),
+            ref_audio=str(ref_audio),
+            ref_text=ref_text.strip() if ref_text and ref_text.strip() else None,
+            x_vector_only_mode=not bool(ref_text and ref_text.strip()),
             max_new_tokens=2048,
         )
         sf.write(str(out_path), wavs[0], sr)
-        tmp_path.unlink(missing_ok=True)
     except Exception as e:
         import traceback
         traceback.print_exc()
-        tmp_path.unlink(missing_ok=True)
-        return Div(P(f"Generation failed: {e}"), cls="err")
+        raise gr.Error(f"Generation failed: {e}")
 
     if not out_path.exists():
-        return Div(P("Output file was not created. Please try again."), cls="err")
+        raise gr.Error("Output file was not created. Please try again.")
 
     _add_history(out_name, text.strip(), "clone", language, voice_desc)
-    pretty_name = f"{_slug(text.strip())}.wav"
-
-    return Div(
-        Div(
-            P("Generated successfully", cls="status"),
-            Audio(src=f"/audio/{out_name}", controls=True, autoplay=True),
-            A(f"Download {pretty_name}", href=f"/download/{out_name.removesuffix('.wav')}", download=pretty_name, cls="dl-link"),
-            cls="result-ok fi",
-        ),
-        sidebar_history(),
-        Script("document.getElementById('sidebar-history').replaceWith(document.querySelectorAll('#sidebar-history')[1])"),
-    )
+    return str(out_path), str(out_path), render_history_html()
 
 
-@rt("/transcribe")
-async def post_transcribe(audio_file: UploadFile, whisper_model: str = "base",
-                          whisper_lang: str = ""):
-    if not audio_file or not audio_file.filename:
-        return Div(P("Please upload an audio file."), cls="err")
-
-    ext = Path(audio_file.filename).suffix.lower()
-    tmp_name = f"{uuid.uuid4().hex}{ext}"
-    tmp_path = UPLOAD_DIR / tmp_name
-    content = await audio_file.read()
-    tmp_path.write_bytes(content)
+# ---------------------------------------------------------------------------
+# Save / Load voice clone prompt
+# ---------------------------------------------------------------------------
+def save_voice_prompt(ref_audio, ref_text, model_size):
+    if ref_audio is None:
+        raise gr.Error("Please upload a reference audio file.")
 
     try:
-        model = get_whisper_model(whisper_model)
+        model = get_tts_model("base", model_size)
+        x_vec_only = not bool(ref_text and ref_text.strip())
+        items = model.create_voice_clone_prompt(
+            ref_audio=str(ref_audio),
+            ref_text=ref_text.strip() if ref_text and ref_text.strip() else None,
+            x_vector_only_mode=x_vec_only,
+        )
+        payload = {"items": [asdict(it) for it in items]}
+        out_name = f"voice_{uuid.uuid4().hex[:8]}.pt"
+        out_path = VOICES_DIR / out_name
+        torch.save(payload, str(out_path))
+        return str(out_path), f"Voice saved: {out_name}"
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise gr.Error(f"Save failed: {e}")
+
+
+def generate_from_voice_prompt(text, language, voice_file, model_size):
+    if not text or not text.strip():
+        raise gr.Error("Please enter some text to speak.")
+    if voice_file is None:
+        raise gr.Error("Please upload a saved voice file (.pt).")
+
+    from qwen_tts import VoiceClonePromptItem
+
+    try:
+        path = voice_file if isinstance(voice_file, str) else voice_file.name
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(payload, dict) or "items" not in payload:
+            raise gr.Error("Invalid voice file format.")
+
+        items = []
+        for d in payload["items"]:
+            ref_code = d.get("ref_code")
+            if ref_code is not None and not torch.is_tensor(ref_code):
+                ref_code = torch.tensor(ref_code)
+            ref_spk = d.get("ref_spk_embedding")
+            if ref_spk is not None and not torch.is_tensor(ref_spk):
+                ref_spk = torch.tensor(ref_spk)
+            items.append(VoiceClonePromptItem(
+                ref_code=ref_code,
+                ref_spk_embedding=ref_spk,
+                x_vector_only_mode=bool(d.get("x_vector_only_mode", False)),
+                icl_mode=bool(d.get("icl_mode", True)),
+                ref_text=d.get("ref_text"),
+            ))
+
+        model = get_tts_model("base", model_size)
+        wavs, sr = model.generate_voice_clone(
+            text=text.strip(),
+            language=language,
+            voice_clone_prompt=items,
+            max_new_tokens=2048,
+        )
+
+        out_name = f"{uuid.uuid4().hex}.wav"
+        out_path = OUTPUT_DIR / out_name
+        sf.write(str(out_path), wavs[0], sr)
+
+        _add_history(out_name, text.strip(), "clone", language, f"Saved voice · {model_size}")
+        return str(out_path), str(out_path), render_history_html()
+    except gr.Error:
+        raise
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise gr.Error(f"Generation failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Generate speech: Custom Voice (preset speakers)
+# ---------------------------------------------------------------------------
+SPEAKERS = ["Vivian", "Serena", "Uncle_Fu", "Dylan", "Eric",
+            "Ryan", "Aiden", "Ono_Anna", "Sohee"]
+
+
+def generate_custom_voice(text, language, speaker, instruct, model_size):
+    if not text or not text.strip():
+        raise gr.Error("Please enter some text to speak.")
+    if not speaker:
+        raise gr.Error("Please select a speaker.")
+
+    out_name = f"{uuid.uuid4().hex}.wav"
+    out_path = OUTPUT_DIR / out_name
+    voice_desc = f"{speaker} · {model_size}"
+
+    try:
+        model = get_tts_model("custom_voice", model_size)
+        wavs, sr = model.generate_custom_voice(
+            text=text.strip(),
+            language=language,
+            speaker=speaker,
+            instruct=instruct.strip() if instruct and instruct.strip() else None,
+            max_new_tokens=2048,
+        )
+        sf.write(str(out_path), wavs[0], sr)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise gr.Error(f"Generation failed: {e}")
+
+    if not out_path.exists():
+        raise gr.Error("Output file was not created.")
+
+    _add_history(out_name, text.strip(), "custom_voice", language, voice_desc)
+    return str(out_path), str(out_path), render_history_html()
+
+
+# ---------------------------------------------------------------------------
+# Generate speech: Voice Design (create voice from description)
+# ---------------------------------------------------------------------------
+def generate_voice_design(text, language, instruct):
+    if not text or not text.strip():
+        raise gr.Error("Please enter some text to speak.")
+    if not instruct or not instruct.strip():
+        raise gr.Error("Please describe the voice you want.")
+
+    out_name = f"{uuid.uuid4().hex}.wav"
+    out_path = OUTPUT_DIR / out_name
+    voice_desc = instruct.strip()[:40]
+
+    try:
+        model = get_tts_model("voice_design", "1.7B")
+        wavs, sr = model.generate_voice_design(
+            text=text.strip(),
+            language=language,
+            instruct=instruct.strip(),
+            max_new_tokens=2048,
+        )
+        sf.write(str(out_path), wavs[0], sr)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise gr.Error(f"Generation failed: {e}")
+
+    if not out_path.exists():
+        raise gr.Error("Output file was not created.")
+
+    _add_history(out_name, text.strip(), "voice_design", language, voice_desc)
+    return str(out_path), str(out_path), render_history_html()
+
+
+# ---------------------------------------------------------------------------
+# Transcribe audio
+# ---------------------------------------------------------------------------
+def transcribe_audio(audio_file, whisper_model_size, whisper_lang):
+    if audio_file is None:
+        raise gr.Error("Please upload an audio file.")
+
+    try:
+        model = get_whisper_model(whisper_model_size)
         t0 = time.perf_counter()
 
         opts = {"word_timestamps": True, "verbose": False}
         if whisper_lang:
             opts["language"] = whisper_lang
 
-        result = model.transcribe(str(tmp_path), **opts)
+        result = model.transcribe(str(audio_file), **opts)
         elapsed = time.perf_counter() - t0
 
         full_text = result.get("text", "").strip()
@@ -713,77 +543,549 @@ async def post_transcribe(audio_file: UploadFile, whisper_model: str = "base",
             "text": full_text,
             "language": detected_lang,
             "words": words_data,
-            "model": whisper_model,
+            "model": whisper_model_size,
             "elapsed": round(elapsed, 1),
-            "source": audio_file.filename,
+            "source": Path(audio_file).name,
         }, indent=2, ensure_ascii=False), encoding="utf-8")
 
         _add_history(json_name, full_text, "transcribe", detected_lang,
-                     f"{whisper_model} · {elapsed:.1f}s")
+                     f"{whisper_model_size} \u00b7 {elapsed:.1f}s")
 
-        tmp_path.unlink(missing_ok=True)
-        pretty_json = f"{_slug(full_text)}.json"
-
-        return Div(
-            Div(
-                P("Transcription complete", cls="status"),
-                Div(Pre(full_text, id="transcript-text"), cls="transcript-box"),
-                Div(
-                    f"{len(words_data)} words · {detected_lang} · {whisper_model} · {elapsed:.1f}s",
-                    cls="transcript-meta",
-                ),
-                Div(
-                    Button("Copy", id="copy-btn", onclick="copyTranscript()", cls="si-btn dl"),
-                    A("Download JSON", href=f"/transcript/{json_name.removesuffix('.json')}", download=pretty_json, cls="dl-link"),
-                    cls="transcript-actions",
-                ),
-                cls="result-ok fi",
-            ),
-            sidebar_history(),
-            Script("document.getElementById('sidebar-history').replaceWith(document.querySelectorAll('#sidebar-history')[1])"),
-        )
+        meta = f"{len(words_data)} words \u00b7 {detected_lang} \u00b7 {whisper_model_size} \u00b7 {elapsed:.1f}s"
+        return full_text, meta, str(json_path), render_history_html()
 
     except Exception as e:
         import traceback
         traceback.print_exc()
-        tmp_path.unlink(missing_ok=True)
-        return Div(P(f"Transcription failed: {e}"), cls="err")
+        raise gr.Error(f"Transcription failed: {e}")
 
 
-@rt("/download/{fid}")
-def get_download(fid: str):
-    fname = fid + ".wav"
-    fpath = OUTPUT_DIR / fname
-    if not fpath.exists():
-        return Response("File not found", status_code=404)
-    entry = _find_entry(fname)
-    dl_name = f"{_slug(entry['text'])}.wav" if entry else fname
-    return Response(
-        content=fpath.read_bytes(),
-        media_type="audio/wav",
-        headers={"Content-Disposition": f'attachment; filename="{dl_name}"'},
+# ---------------------------------------------------------------------------
+# Custom CSS
+# ---------------------------------------------------------------------------
+CUSTOM_CSS = """
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+/* History sidebar styles */
+.sidebar-hdr {
+    display: flex; align-items: center; justify-content: space-between;
+    margin-bottom: 10px; padding: 0 4px;
+}
+.sidebar-hdr h3 {
+    font-size: .7rem; font-weight: 600; color: #71717a;
+    text-transform: uppercase; letter-spacing: .5px; margin: 0;
+}
+.sidebar-count { font-size: .68rem; color: #52525b; }
+
+.si {
+    display: flex; align-items: flex-start; gap: 8px;
+    padding: 7px 8px;
+    background: #18181b; border: 1px solid transparent; border-radius: 8px;
+    margin-bottom: 3px; transition: all .15s; cursor: default;
+}
+.si:hover { border-color: #27272a; background: #1c1c1f; }
+
+.si-icon {
+    width: 26px; height: 26px; border-radius: 6px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: .65rem; font-weight: 700; flex-shrink: 0; margin-top: 1px;
+}
+.si-icon.clone { background: #172554; color: #60a5fa; }
+.si-icon.custom-voice { background: #3b0764; color: #c084fc; }
+.si-icon.design { background: #713f12; color: #fbbf24; }
+.si-icon.transcribe { background: #052e16; color: #4ade80; }
+
+.si-meta { flex: 1; min-width: 0; }
+.si-text {
+    font-size: .75rem; color: #d4d4d8;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.si-sub { font-size: .62rem; color: #52525b; margin-top: 1px; }
+
+.si-dl {
+    width: 22px; height: 22px; border-radius: 5px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: .82rem; line-height: 1; color: #71717a;
+    background: transparent; border: 1px solid transparent;
+    text-decoration: none; flex-shrink: 0; margin-top: 2px;
+    transition: all .15s;
+}
+.si-dl:hover { color: #e4e4e7; background: #27272a; border-color: #3f3f46; }
+
+.si-del {
+    width: 22px; height: 22px; border-radius: 5px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: .85rem; line-height: 1; color: #52525b;
+    background: transparent; border: 1px solid transparent;
+    cursor: pointer; flex-shrink: 0; margin-top: 2px;
+    transition: all .15s; padding: 0;
+}
+.si-del:hover { color: #f87171; background: #2a1215; border-color: #7f1d1d; }
+
+.hist-empty {
+    text-align: center; color: #52525b; font-size: .78rem; padding: 30px 16px;
+}
+
+/* Brand header */
+.brand-header {
+    text-align: center; padding: 16px 12px; margin-bottom: 8px;
+}
+.brand-header h1 {
+    font-size: 1.3rem; font-weight: 700; color: #f4f4f5;
+    letter-spacing: -.02em; margin: 0;
+}
+.brand-header p {
+    color: #52525b; font-size: .72rem; margin-top: 2px;
+}
+
+/* Compact history panel */
+.history-panel {
+    max-height: calc(100vh - 100px);
+    overflow-y: auto;
+    padding: 8px;
+}
+.history-panel::-webkit-scrollbar { width: 4px; }
+.history-panel::-webkit-scrollbar-thumb { background: #27272a; border-radius: 4px; }
+
+/* Remove extra padding from the sidebar column */
+#sidebar-col { padding: 0 !important; }
+
+/* Transcript meta styling */
+.transcript-meta {
+    font-size: .82rem; color: #a1a1aa; padding: 6px 0;
+}
+
+/* Sidebar action buttons */
+.sidebar-actions { padding: 4px 8px !important; gap: 6px !important; }
+.clear-btn {
+    font-size: .72rem !important;
+    opacity: .7;
+    transition: opacity .15s;
+}
+.clear-btn:hover { opacity: 1; }
+
+/* Speaker grid */
+.speaker-info {
+    font-size: .75rem; color: #71717a; padding: 4px 0;
+}
+"""
+
+# ---------------------------------------------------------------------------
+# Theme
+# ---------------------------------------------------------------------------
+theme = gr.themes.Base(
+    primary_hue=gr.themes.colors.indigo,
+    secondary_hue=gr.themes.colors.green,
+    neutral_hue=gr.themes.colors.zinc,
+    font=gr.themes.GoogleFont("Inter"),
+).set(
+    body_background_fill="#09090b",
+    body_background_fill_dark="#09090b",
+    block_background_fill="#18181b",
+    block_background_fill_dark="#18181b",
+    block_border_color="#27272a",
+    block_border_color_dark="#27272a",
+    block_label_text_color="#a1a1aa",
+    block_label_text_color_dark="#a1a1aa",
+    block_title_text_color="#f4f4f5",
+    block_title_text_color_dark="#f4f4f5",
+    body_text_color="#e4e4e7",
+    body_text_color_dark="#e4e4e7",
+    body_text_color_subdued="#71717a",
+    body_text_color_subdued_dark="#71717a",
+    input_background_fill="#09090b",
+    input_background_fill_dark="#09090b",
+    input_border_color="#27272a",
+    input_border_color_dark="#27272a",
+    button_primary_background_fill="#818cf8",
+    button_primary_background_fill_dark="#818cf8",
+    button_primary_text_color="#09090b",
+    button_primary_text_color_dark="#09090b",
+    button_primary_background_fill_hover="#a5b4fc",
+    button_primary_background_fill_hover_dark="#a5b4fc",
+    button_secondary_background_fill="#27272a",
+    button_secondary_background_fill_dark="#27272a",
+    button_secondary_text_color="#e4e4e7",
+    button_secondary_text_color_dark="#e4e4e7",
+    button_secondary_border_color="#3f3f46",
+    button_secondary_border_color_dark="#3f3f46",
+    border_color_primary="#27272a",
+    border_color_primary_dark="#27272a",
+    color_accent="#818cf8",
+    shadow_drop="none",
+    shadow_drop_lg="none",
+)
+
+# ---------------------------------------------------------------------------
+# Gradio UI
+# ---------------------------------------------------------------------------
+LANGUAGES = ["Auto", "English", "Chinese", "Japanese", "Korean", "German",
+             "French", "Russian", "Portuguese", "Spanish", "Italian"]
+
+MODEL_SIZES = ["1.7B", "0.6B"]
+
+WHISPER_MODELS = [
+    ("tiny (fastest)", "tiny"),
+    ("base (default)", "base"),
+    ("small", "small"),
+    ("medium", "medium"),
+    ("large (best)", "large"),
+    ("turbo", "turbo"),
+]
+
+WHISPER_LANGS = [
+    ("Auto-detect", ""),
+    ("English", "en"),
+    ("Chinese", "zh"),
+    ("Japanese", "ja"),
+    ("Korean", "ko"),
+    ("German", "de"),
+    ("French", "fr"),
+    ("Russian", "ru"),
+    ("Portuguese", "pt"),
+    ("Spanish", "es"),
+    ("Italian", "it"),
+]
+
+DELETE_JS = """
+function deleteHistoryItem(fname) {
+    const el = document.querySelector('#delete-trigger textarea, #delete-trigger input');
+    if (!el) return;
+    const setter = Object.getOwnPropertyDescriptor(
+        Object.getPrototypeOf(el), 'value'
+    ).set;
+    setter.call(el, fname);
+    el.dispatchEvent(new Event('input', {bubbles: true}));
+}
+"""
+
+with gr.Blocks(title="VocalFlow") as app:
+
+    with gr.Row():
+        # -- Sidebar --
+        with gr.Column(scale=1, min_width=160, elem_id="sidebar-col"):
+            gr.HTML('<div class="brand-header"><h1>VocalFlow</h1><p>TTS &amp; Transcription</p></div>')
+            history_html = gr.HTML(
+                value=render_history_html,
+                elem_classes=["history-panel"],
+            )
+            # Hidden textbox used by JS to trigger per-item delete
+            delete_trigger = gr.Textbox(visible=False, elem_id="delete-trigger")
+            with gr.Row(elem_classes=["sidebar-actions"]):
+                clear_btn = gr.Button(
+                    "Clear History",
+                    variant="stop",
+                    size="sm",
+                    elem_classes=["clear-btn"],
+                )
+                unload_btn = gr.Button(
+                    "Unload Models",
+                    variant="secondary",
+                    size="sm",
+                    elem_classes=["clear-btn"],
+                )
+
+        # -- Main content --
+        with gr.Column(scale=3):
+            with gr.Tabs():
+                # ===== Voice Clone Tab =====
+                with gr.Tab("Voice Clone"):
+                    gr.Markdown("### Clone a Voice")
+                    with gr.Group():
+                        vc_text = gr.Textbox(
+                            label="Text to Speak",
+                            placeholder="Enter the text you want to convert to speech...",
+                            lines=4,
+                        )
+                        with gr.Row():
+                            vc_language = gr.Dropdown(
+                                choices=LANGUAGES,
+                                value="English",
+                                label="Language",
+                            )
+                            vc_model_size = gr.Dropdown(
+                                choices=MODEL_SIZES,
+                                value="1.7B",
+                                label="Model Size",
+                            )
+                    with gr.Group():
+                        vc_ref_audio = gr.Audio(
+                            label="Reference Audio (3-10s recommended)",
+                            type="filepath",
+                            sources=["upload"],
+                        )
+                        vc_ref_text = gr.Textbox(
+                            label="Transcript (recommended for best quality)",
+                            placeholder="What the speaker says in the uploaded audio...",
+                            lines=2,
+                        )
+                    vc_btn = gr.Button("Generate Speech", variant="primary", size="lg")
+
+                    vc_audio_out = gr.Audio(label="Generated Speech", type="filepath", interactive=False)
+                    vc_file_out = gr.File(label="Download", interactive=False, visible=False)
+
+                    # -- Save / Load Voice sub-section --
+                    with gr.Accordion("Save & Load Voice Prompts", open=False):
+                        gr.Markdown("Save a reference voice as a reusable `.pt` file, then load it later without re-uploading audio.")
+                        with gr.Row():
+                            with gr.Column():
+                                sv_ref_audio = gr.Audio(
+                                    label="Reference Audio",
+                                    type="filepath",
+                                    sources=["upload"],
+                                )
+                                sv_ref_text = gr.Textbox(
+                                    label="Transcript (optional)",
+                                    lines=2,
+                                )
+                                sv_model_size = gr.Dropdown(
+                                    choices=MODEL_SIZES,
+                                    value="1.7B",
+                                    label="Model Size",
+                                )
+                                sv_btn = gr.Button("Save Voice", variant="secondary")
+                                sv_file_out = gr.File(label="Voice File", interactive=False)
+                                sv_status = gr.Textbox(label="Status", interactive=False)
+
+                            with gr.Column():
+                                lv_file = gr.File(
+                                    label="Upload Saved Voice (.pt)",
+                                    file_types=[".pt"],
+                                )
+                                lv_text = gr.Textbox(
+                                    label="Text to Speak",
+                                    placeholder="Enter text to generate with saved voice...",
+                                    lines=3,
+                                )
+                                lv_language = gr.Dropdown(
+                                    choices=LANGUAGES,
+                                    value="English",
+                                    label="Language",
+                                )
+                                lv_model_size = gr.Dropdown(
+                                    choices=MODEL_SIZES,
+                                    value="1.7B",
+                                    label="Model Size",
+                                )
+                                lv_btn = gr.Button("Generate from Saved Voice", variant="primary")
+                                lv_audio_out = gr.Audio(label="Output", type="filepath", interactive=False)
+                                lv_file_out = gr.File(label="Download", interactive=False, visible=False)
+
+                # ===== Custom Voice Tab =====
+                with gr.Tab("Custom Voice"):
+                    gr.Markdown("### Preset Speakers with Instruction Control")
+                    gr.HTML('<div class="speaker-info">9 premium voices. The 1.7B model supports instruction control for emotion, tone, and style. The 0.6B model supports speakers only (no instructions).</div>')
+                    with gr.Group():
+                        cv_text = gr.Textbox(
+                            label="Text to Speak",
+                            placeholder="Enter the text you want to convert to speech...",
+                            lines=4,
+                        )
+                        with gr.Row():
+                            cv_language = gr.Dropdown(
+                                choices=LANGUAGES,
+                                value="Auto",
+                                label="Language",
+                            )
+                            cv_speaker = gr.Dropdown(
+                                choices=SPEAKERS,
+                                value="Vivian",
+                                label="Speaker",
+                            )
+                            cv_model_size = gr.Dropdown(
+                                choices=MODEL_SIZES,
+                                value="1.7B",
+                                label="Model Size",
+                            )
+                    with gr.Group():
+                        cv_instruct = gr.Textbox(
+                            label="Instruction (optional, 1.7B only)",
+                            placeholder="e.g. Say it in an excited, cheerful tone",
+                            lines=2,
+                        )
+                    cv_btn = gr.Button("Generate Speech", variant="primary", size="lg")
+
+                    cv_audio_out = gr.Audio(label="Generated Speech", type="filepath", interactive=False)
+                    cv_file_out = gr.File(label="Download", interactive=False, visible=False)
+
+                # ===== Voice Design Tab =====
+                with gr.Tab("Voice Design"):
+                    gr.Markdown("### Create a Voice from a Description")
+                    gr.HTML('<div class="speaker-info">Describe the voice you want in natural language \u2014 no reference audio needed. Uses the 1.7B VoiceDesign model.</div>')
+                    with gr.Group():
+                        vd_text = gr.Textbox(
+                            label="Text to Speak",
+                            placeholder="Enter the text you want to convert to speech...",
+                            lines=4,
+                            value="It's in the top drawer... wait, it's empty? No way, that's impossible!",
+                        )
+                        vd_language = gr.Dropdown(
+                            choices=LANGUAGES,
+                            value="Auto",
+                            label="Language",
+                        )
+                    with gr.Group():
+                        vd_instruct = gr.Textbox(
+                            label="Voice Description",
+                            placeholder="e.g. Male, mid-30s, deep baritone, speaking with calm authority",
+                            lines=3,
+                            value="Speak in an incredulous tone, with a hint of panic creeping into your voice.",
+                        )
+                    vd_btn = gr.Button("Generate Speech", variant="primary", size="lg")
+
+                    vd_audio_out = gr.Audio(label="Generated Speech", type="filepath", interactive=False)
+                    vd_file_out = gr.File(label="Download", interactive=False, visible=False)
+
+                # ===== Transcribe Tab =====
+                with gr.Tab("Transcribe"):
+                    gr.Markdown("### Transcribe Audio")
+                    with gr.Group():
+                        tr_audio = gr.Audio(
+                            label="Audio File",
+                            type="filepath",
+                            sources=["upload"],
+                        )
+                        tr_model = gr.Dropdown(
+                            choices=WHISPER_MODELS,
+                            value="base",
+                            label="Whisper Model",
+                        )
+                        tr_lang = gr.Dropdown(
+                            choices=WHISPER_LANGS,
+                            value="",
+                            label="Language (optional)",
+                        )
+                    tr_btn = gr.Button("Transcribe", variant="primary", size="lg")
+
+                    tr_text_out = gr.Textbox(label="Transcript", lines=10, interactive=False)
+                    tr_meta_out = gr.Markdown(elem_classes=["transcript-meta"])
+                    tr_file_out = gr.File(label="Download JSON", interactive=False, visible=False)
+
+    # -- Event handlers --
+
+    # Voice Clone
+    def on_generate_clone(text, language, ref_audio, ref_text, model_size):
+        audio_path, file_path, hist = generate_speech(text, language, ref_audio, ref_text, model_size)
+        return (
+            audio_path,
+            gr.File(value=file_path, visible=True),
+            hist,
+        )
+
+    vc_btn.click(
+        fn=on_generate_clone,
+        inputs=[vc_text, vc_language, vc_ref_audio, vc_ref_text, vc_model_size],
+        outputs=[vc_audio_out, vc_file_out, history_html],
     )
 
+    # Save voice
+    def on_save_voice(ref_audio, ref_text, model_size):
+        file_path, status = save_voice_prompt(ref_audio, ref_text, model_size)
+        return gr.File(value=file_path), status
 
-@rt("/transcript/{fid}")
-def get_transcript(fid: str):
-    fname = fid + ".json"
-    fpath = TRANSCRIPT_DIR / fname
-    if not fpath.exists():
-        return Response("File not found", status_code=404)
-    entry = _find_entry(fname)
-    dl_name = f"{_slug(entry['text'])}.json" if entry else fname
-    return Response(
-        content=fpath.read_bytes(),
-        media_type="application/json",
-        headers={"Content-Disposition": f'attachment; filename="{dl_name}"'},
+    sv_btn.click(
+        fn=on_save_voice,
+        inputs=[sv_ref_audio, sv_ref_text, sv_model_size],
+        outputs=[sv_file_out, sv_status],
     )
 
+    # Load voice + generate
+    def on_generate_from_voice(text, language, voice_file, model_size):
+        audio_path, file_path, hist = generate_from_voice_prompt(text, language, voice_file, model_size)
+        return (
+            audio_path,
+            gr.File(value=file_path, visible=True),
+            hist,
+        )
 
-@rt("/sidebar")
-def get_sidebar():
-    return sidebar_history()
+    lv_btn.click(
+        fn=on_generate_from_voice,
+        inputs=[lv_text, lv_language, lv_file, lv_model_size],
+        outputs=[lv_audio_out, lv_file_out, history_html],
+    )
+
+    # Custom Voice
+    def on_generate_custom(text, language, speaker, instruct, model_size):
+        audio_path, file_path, hist = generate_custom_voice(text, language, speaker, instruct, model_size)
+        return (
+            audio_path,
+            gr.File(value=file_path, visible=True),
+            hist,
+        )
+
+    cv_btn.click(
+        fn=on_generate_custom,
+        inputs=[cv_text, cv_language, cv_speaker, cv_instruct, cv_model_size],
+        outputs=[cv_audio_out, cv_file_out, history_html],
+    )
+
+    # Voice Design
+    def on_generate_design(text, language, instruct):
+        audio_path, file_path, hist = generate_voice_design(text, language, instruct)
+        return (
+            audio_path,
+            gr.File(value=file_path, visible=True),
+            hist,
+        )
+
+    vd_btn.click(
+        fn=on_generate_design,
+        inputs=[vd_text, vd_language, vd_instruct],
+        outputs=[vd_audio_out, vd_file_out, history_html],
+    )
+
+    # Transcribe
+    def on_transcribe(audio_file, whisper_model_size, whisper_lang):
+        full_text, meta, json_path, hist = transcribe_audio(audio_file, whisper_model_size, whisper_lang)
+        return (
+            full_text,
+            meta,
+            gr.File(value=json_path, visible=True),
+            hist,
+        )
+
+    tr_btn.click(
+        fn=on_transcribe,
+        inputs=[tr_audio, tr_model, tr_lang],
+        outputs=[tr_text_out, tr_meta_out, tr_file_out, history_html],
+    )
+
+    # Clear history
+    clear_btn.click(
+        fn=clear_history_and_files,
+        inputs=[],
+        outputs=[history_html],
+    )
+
+    # Unload models
+    def on_unload_models():
+        n = unload_all_models()
+        if n == 0:
+            gr.Info("No models are loaded.")
+        else:
+            gr.Info(f"Unloaded {n} model(s). GPU memory freed.")
+        return render_history_html()
+
+    unload_btn.click(
+        fn=on_unload_models,
+        inputs=[],
+        outputs=[history_html],
+    )
+
+    # Per-item delete: JS sets the hidden textbox, which triggers this handler
+    delete_trigger.change(
+        fn=lambda fname: (delete_history_item(fname), ""),
+        inputs=[delete_trigger],
+        outputs=[history_html, delete_trigger],
+    )
 
 
 if __name__ == "__main__":
-    serve()
+    app.launch(
+        server_name="127.0.0.1",
+        server_port=5001,
+        allowed_paths=[str(OUTPUT_DIR), str(TRANSCRIPT_DIR)],
+        css=CUSTOM_CSS,
+        js=DELETE_JS,
+        theme=theme,
+    )
