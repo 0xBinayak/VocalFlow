@@ -14,7 +14,8 @@ from datetime import datetime
 # shutil.which, then import sox with stderr silenced and fix the flag.
 import shutil
 if shutil.which("sox"):
-    import contextlib, subprocess
+    import contextlib
+    import subprocess
     with open(os.devnull, "w") as _devnull, contextlib.redirect_stderr(_devnull):
         # Monkey-patch os.popen for the duration of the sox import so the
         # broken cmd.exe check doesn't spam the console.
