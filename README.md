@@ -13,24 +13,21 @@
 
 ---
 
-Self-hosted web app that runs entirely on your machine. No cloud APIs, no data leaves your PC.
+Self-hosted web app powered by [Qwen3-TTS](https://huggingface.co/Qwen) and [Whisper](https://github.com/openai/whisper). Everything runs locally — no cloud APIs, no data leaves your machine.
 
 ## Features
 
-- **Voice Cloning** — clone any voice from a short audio clip (3-10s), save & reuse voice prompts
-- **Custom Voice** — 9 preset speakers with emotion/tone control ("say it angrily", "whisper softly")
-- **Voice Design** — create new voices from text descriptions, no reference audio needed
-- **Transcription** — Whisper-powered transcription with word-level timestamps, 6 model sizes
-- **Smart GPU** — automatic model load/unload between switches, only one model in VRAM at a time
-- **Flash Attention 2** for faster inference
-- 10+ languages with auto-detection
+- **Voice Cloning** — clone any voice from a short audio clip, save and reuse voice prompts
+- **Custom Voice** — 9 preset speakers with emotion and tone control
+- **Voice Design** — create new voices from natural language descriptions
+- **Transcription** — word-level timestamps, 6 model sizes, auto language detection
+- **Smart GPU** — automatic model switching with VRAM cleanup, Flash Attention 2
+- **10+ languages** including English, Chinese, Japanese, Korean, and more
 
 ## Requirements
 
-- **Windows 10/11** with a CUDA GPU (6+ GB VRAM)
-- **Python 3.11**
-- [FFmpeg](https://ffmpeg.org/) — `winget install ffmpeg`
-- [SoX](https://sox.sourceforge.net/) — `winget install sox`
+- **Windows 10/11** with a CUDA GPU (6 GB+ VRAM)
+- **Python 3.11** &ensp;|&ensp; [FFmpeg](https://ffmpeg.org/) `winget install ffmpeg` &ensp;|&ensp; [SoX](https://sox.sourceforge.net/) `winget install sox`
 
 ## Quick Start
 
@@ -39,44 +36,22 @@ pip install vocalflow
 vocalflow
 ```
 
-Open **http://localhost:5001**. Models download automatically on first use.
+Open **http://localhost:5001** &mdash; models download automatically on first use.
 
 ### From source
 
 ```
-git clone https://github.com/0xBinayak/VocalFlow.git
-cd VocalFlow
-uv sync
-uv run app.py
+git clone https://github.com/0xBinayak/VocalFlow.git && cd VocalFlow
+uv sync && uv run app.py
 ```
 
-For auto-reload during development: `uv run gradio app.py`
-
-## Models
-
-| Model | Params | Use |
-|-------|--------|-----|
-| Qwen3-TTS-1.7B-Base | 1.7B | Voice cloning (best quality) |
-| Qwen3-TTS-0.6B-Base | 0.6B | Voice cloning (faster) |
-| Qwen3-TTS-1.7B-CustomVoice | 1.7B | Preset speakers + instructions |
-| Qwen3-TTS-0.6B-CustomVoice | 0.6B | Preset speakers only |
-| Qwen3-TTS-1.7B-VoiceDesign | 1.7B | Voice from text description |
-| Whisper (tiny-turbo) | 39M-1.5B | Transcription |
-
-All TTS models run in bfloat16 with SDPA/Flash Attention. Whisper falls back to CPU if no GPU.
+Dev mode with auto-reload: `uv run gradio app.py`
 
 ## Contributing
 
-1. Fork & clone, `uv sync`, create a branch
-2. Ensure `uvx ruff check app.py transcribe.py main.py` passes
-3. Open a PR against `main`
-
-[Open an issue](https://github.com/0xBinayak/VocalFlow/issues) if you find a bug.
+Fork, `uv sync`, branch, ensure `uvx ruff check app.py transcribe.py main.py` passes, PR.
+&ensp;[Report a bug](https://github.com/0xBinayak/VocalFlow/issues)
 
 ## License
 
-MIT
-
-## Acknowledgments
-
-[Qwen3-TTS](https://huggingface.co/Qwen) | [OpenAI Whisper](https://github.com/openai/whisper) | [Gradio](https://www.gradio.app/)
+MIT &ensp;|&ensp; [Qwen3-TTS](https://huggingface.co/Qwen) &ensp;|&ensp; [OpenAI Whisper](https://github.com/openai/whisper) &ensp;|&ensp; [Gradio](https://www.gradio.app/)
